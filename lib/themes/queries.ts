@@ -55,11 +55,12 @@ export async function createCustomTheme(params: {
   readonly seedSql: string;
   readonly schemaRef: SchemaReference;
   readonly tableMapping: Record<string, string> | null;
+  readonly sourceDialect?: string | null;
 }): Promise<CustomThemeRow> {
   const pool = getAdminPool();
   const result = await pool.query(
-    `INSERT INTO custom_themes (org_id, slug, name, description, schema_sql, seed_sql, schema_ref, table_mapping)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    `INSERT INTO custom_themes (org_id, slug, name, description, schema_sql, seed_sql, schema_ref, table_mapping, source_dialect)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
      RETURNING id, org_id, slug, name, description, schema_ref, table_mapping, status, error_message, created_at`,
     [
       params.orgId,
@@ -70,6 +71,7 @@ export async function createCustomTheme(params: {
       params.seedSql,
       JSON.stringify(params.schemaRef),
       params.tableMapping ? JSON.stringify(params.tableMapping) : null,
+      params.sourceDialect ?? null,
     ]
   );
   return result.rows[0] as CustomThemeRow;

@@ -15,8 +15,9 @@ CREATE TABLE custom_themes (
   table_mapping JSONB,
   status        TEXT NOT NULL DEFAULT 'pending'
                 CHECK (status IN ('pending', 'provisioned', 'error')),
-  error_message TEXT,
-  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  error_message   TEXT,
+  source_dialect  TEXT CHECK (source_dialect IN ('postgresql', 'mysql', 'sqlite', 'sqlserver', 'csv')),
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE custom_theme_exercises (

@@ -146,7 +146,7 @@ export async function provisionCustomTheme(
     } catch {
       // Ignore cleanup errors
     }
-    const message = err instanceof Error ? err.message : "Unknown error";
+    const message = extractPgError(err);
     return { success: false, error: message };
   } finally {
     try {
@@ -166,4 +166,28 @@ export async function deprovisionCustomTheme(slug: string): Promise<void> {
   const schemaName = `theme_custom_${slug.replace(/-/g, "_")}`;
   const pool = getAdminPool();
   await pool.query(`DROP SCHEMA IF EXISTS "${schemaName}" CASCADE`);
+}
+
+/**
+ * Extract a meaningful error string from a PostgreSQL error object.
+ * Includes position/detail/hint when available for debugging.
+ */
+function extractPgError(err: unknown): string {
+  if (!(err instanceof Error)) return "Unknown database error";
+
+  // pg library errors include additional properties
+  const pgErr = err as unknown as Record<string, unknown>;
+  const parts: string[] = [err.message];
+
+  if (typeof pgErr.detail === "string" && pgErr.detail) {
+    parts.push(`Detail: ${pgErr.detail}`);
+  }
+  if (typeof pgErr.hint === "string" && pgErr.hint) {
+    parts.push(`Hint: ${pgErr.hint}`);
+  }
+  if (typeof pgErr.position === "string" && pgErr.position) {
+    parts.push(`At character position: ${pgErr.position}`);
+  }
+
+  return parts.join(" — ");
 }
