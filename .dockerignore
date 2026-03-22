@@ -16,6 +16,9 @@ out
 .git
 .gitignore
 
+# Import files (mounted at runtime via docker-compose volume, not baked into image)
+imports
+
 # Misc
 .DS_Store
 *.pem
