@@ -840,6 +840,9 @@ function convertSqlServer(rawSql: string): ConversionResult {
 
   let sql = rawSql.replace(/\r\n/g, "\n");
 
+  // Replace GO batch separators with semicolons so splitStatements can find boundaries
+  sql = sql.replace(/^\s*GO\s*$/gim, ";");
+
   // Remove SET statements (SET ANSI_NULLS, SET QUOTED_IDENTIFIER, etc.)
   sql = sql.replace(
     /^\s*SET\s+(IDENTITY_INSERT|NOCOUNT|ANSI_NULLS|QUOTED_IDENTIFIER|ANSI_PADDING|ANSI_WARNINGS|CONCAT_NULL_YIELDS_NULL|ARITHABORT|NUMERIC_ROUNDABORT)\b[^;]*;?\s*$/gim,
@@ -853,24 +856,28 @@ function convertSqlServer(rawSql: string): ConversionResult {
   // These can span multiple lines, so use [\s\S] instead of . to match newlines.
   sql = sql.replace(/\/\*{5,}[\s\S]*?\*{5,}\//g, "");
 
+  // Use the proven quote-aware semicolon splitter (not splitSqlServerDump which
+  // can lose sync on rejoined DDL chunks with unbalanced string literals).
+  // backslashEscape=false — SQL Server does NOT use \' as an escape.
+  const stmts = splitStatements(sql);
   const ddlParts: string[] = [];
   const seedParts: string[] = [];
   let skippedCount = 0;
 
-  for (const chunk of splitSqlServerDump(sql)) {
-    const statementKind = chunk.kind === "seed" ? "seed" : classifyStatement(chunk.text);
-    if (statementKind === "ddl") {
-      const converted = convertSqlServerDdl(chunk.text, warnings);
-      if (converted) ddlParts.push(converted.replace(/;+\s*$/g, "") + ";");
-    } else if (statementKind === "seed") {
-      seedParts.push(convertSqlServerDml(chunk.text).replace(/;+\s*$/g, "") + ";");
+  for (const stmt of stmts) {
+    const kind = classifyStatement(stmt);
+    if (kind === "ddl") {
+      const converted = convertSqlServerDdl(stmt, warnings);
+      if (converted) ddlParts.push(converted + ";");
+    } else if (kind === "seed") {
+      seedParts.push(convertSqlServerDml(stmt) + ";");
     } else {
-      skippedCount++;
-      // Only log first few skipped statements to avoid thousands of warnings
-      if (skippedCount <= 10) {
-        warnings.push(
-          `Skipped: ${chunk.text.slice(0, 80)}${chunk.text.length > 80 ? "..." : ""}`,
-        );
+      if (stmt.trim().length > 0) {
+        skippedCount++;
+        // Only log first few skipped statements to avoid thousands of warnings
+        if (skippedCount <= 10) {
+          warnings.push(`Skipped: ${stmt.slice(0, 80)}${stmt.length > 80 ? "..." : ""}`);
+        }
       }
     }
   }
