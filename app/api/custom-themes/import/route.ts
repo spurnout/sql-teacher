@@ -238,12 +238,6 @@ export async function POST(req: NextRequest) {
       schemaSql = ddlResult.ddl;
       warnings = ddlResult.warnings;
       console.log(`[import] DDL conversion complete (${Date.now() - ddlStart}ms)`);
-      console.log(`[import] DDL output size: ${schemaSql.length} chars`);
-      console.log(`[import] DDL first 500 chars:\n${schemaSql.slice(0, 500)}`);
-      console.log(`[import] DDL warnings (${warnings.length}): ${warnings.slice(0, 5).join(" | ")}`);
-      // Check if CREATE TABLE exists in schemaSql
-      const ctCount = (schemaSql.match(/CREATE\s+TABLE/gi) || []).length;
-      console.log(`[import] CREATE TABLE count in DDL output: ${ctCount}`);
 
       // Convert seed data with lightweight processing — for large files, we skip
       // the full converter pipeline (splitStatements is O(n) character-by-character
