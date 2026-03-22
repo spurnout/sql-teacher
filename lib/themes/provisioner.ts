@@ -173,25 +173,6 @@ export async function provisionCustomTheme(
       "SET LOCAL session_replication_role = 'replica'"
     );
 
-    // SQL Server uses 0/1 for BIT columns, but PostgreSQL BOOLEAN rejects
-    // bare integers.  Create an implicit cast so 0→false and 1→true
-    // automatically.  Uses DO blocks to silently skip if already exists.
-    await client.query(`
-      DO $$ BEGIN
-        CREATE FUNCTION public._int4_to_bool(integer)
-          RETURNS boolean LANGUAGE sql IMMUTABLE AS
-          'SELECT $1 <> 0';
-      EXCEPTION WHEN duplicate_function THEN NULL;
-      END $$;
-    `);
-    await client.query(`
-      DO $$ BEGIN
-        CREATE CAST (integer AS boolean)
-          WITH FUNCTION public._int4_to_bool(integer) AS IMPLICIT;
-      EXCEPTION WHEN duplicate_object THEN NULL;
-      END $$;
-    `);
-
     // Execute seed data
     await client.query(seedSql);
 

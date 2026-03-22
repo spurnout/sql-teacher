@@ -800,8 +800,10 @@ function convertSqlServerDdl(stmt: string, _warnings: string[]): string {
   s = s.replace(/(\])\s+\[sql_variant\]/gi, "$1 TEXT");
   s = s.replace(/(\])\s+\[sysname\]/gi, "$1 VARCHAR(128)"); // SQL Server system name type
 
-  // Boolean
-  s = s.replace(/(\])\s+\[bit\]/gi, "$1 BOOLEAN");
+  // Boolean — use SMALLINT instead of BOOLEAN because SQL Server BIT uses
+  // 0/1 in INSERT data, and PostgreSQL BOOLEAN rejects bare integers.
+  // Creating an implicit cast requires superuser, which the app may not have.
+  s = s.replace(/(\])\s+\[bit\]/gi, "$1 SMALLINT");
 
   // Date/time
   s = s.replace(/(\])\s+\[datetime2\](\s*\(\s*\d+\s*\))?/gi, "$1 TIMESTAMP");
