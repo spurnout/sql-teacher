@@ -274,7 +274,9 @@ export async function provisionCustomTheme(
     );
 
     // Execute the user's DDL inside the schema
-    await client.query(`SET LOCAL search_path = '"${schemaName}"', public`);
+    // schemaName is derived from slug validated against SLUG_REGEX ([a-z0-9_])
+    // so it never needs identifier quoting in SET search_path.
+    await client.query(`SET LOCAL search_path = '${schemaName}', 'public'`);
     await client.query(schemaSql);
 
     // Disable FK triggers during seed import — SSMS exports don't guarantee
