@@ -544,10 +544,10 @@ function convertSeedLightweight(seed: string, dialect: string): string {
 
     // Only process INSERT lines and their continuations
     if (upper.startsWith("INSERT")) {
-      // Remove bracket quoting
-      line = line.replace(/\[(\w+)\]/g, "$1");
-      // Remove dbo. prefix
-      line = line.replace(/\bdbo\.\s*/gi, "");
+      // Remove [dbo]. prefix BEFORE bracket-to-quote conversion
+      line = line.replace(/\[dbo\]\.\s*/gi, "");
+      // Convert [bracket] quoting to "double-quoted" identifiers (preserves reserved words)
+      line = line.replace(/\[([^\]]+)\]/g, '"$1"');
       // N'string' → 'string'
       line = line.replace(/\bN'((?:[^']|'')*?)'/g, "'$1'");
       // CAST(N'...' AS DateTime) → '...'::TIMESTAMP (N already stripped above)

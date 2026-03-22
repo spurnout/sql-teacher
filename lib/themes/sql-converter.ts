@@ -804,10 +804,16 @@ function convertSqlServerDdl(stmt: string, _warnings: string[]): string {
   s = s.replace(/(\])\s+\[geometry\]/gi, "$1 TEXT");
   s = s.replace(/(\])\s+\[timestamp\]/gi, "$1 BYTEA"); // SQL Server timestamp = rowversion
 
-  // ── Phase 3: Remove remaining brackets (column/table/constraint names) ──
-  s = s.replace(/\[(\w+)\]/g, "$1");
+  // ── Phase 3: Convert remaining brackets to double-quoted identifiers ──
+  // SQL Server [brackets] → PostgreSQL "double quotes" to preserve reserved-word
+  // identifiers like [Order], [DateTime], [Type], [Status], etc.
 
-  // Remove dbo. schema prefix
+  // Remove [dbo]. schema prefix BEFORE bracket-to-quote conversion
+  s = s.replace(/\[dbo\]\.\s*/gi, "");
+  // Convert remaining bracketed identifiers to double-quoted
+  s = s.replace(/\[([^\]]+)\]/g, '"$1"');
+
+  // Remove any leftover bare dbo. references
   s = s.replace(/\bdbo\.\s*/gi, "");
 
   // ── Phase 4: DDL keyword cleanup ──
@@ -822,7 +828,8 @@ function convertSqlServerDdl(stmt: string, _warnings: string[]): string {
   s = s.replace(/\bCLUSTERED\b/gi, "");
 
   // Strip ASC/DESC from column lists in PRIMARY KEY, UNIQUE, and INDEX defs
-  s = s.replace(/(\b\w+)\s+(?:ASC|DESC)\b/gi, "$1");
+  // Handles both double-quoted identifiers ("Col" ASC) and bare identifiers (Col ASC)
+  s = s.replace(/("[^"]+?"|\w+)\s+(?:ASC|DESC)\b/gi, "$1");
 
   // N'string' → 'string'
   s = s.replace(/\bN'((?:[^']|'')*?)'/g, "'$1'");
@@ -837,10 +844,12 @@ function convertSqlServerDdl(stmt: string, _warnings: string[]): string {
 function convertSqlServerDml(stmt: string): string {
   let s = stmt;
 
-  // Remove [bracket] quoting
-  s = s.replace(/\[(\w+)\]/g, "$1");
+  // Remove [dbo]. prefix BEFORE bracket-to-quote conversion
+  s = s.replace(/\[dbo\]\.\s*/gi, "");
+  // Convert [bracket] quoting to "double-quoted" identifiers (preserves reserved words)
+  s = s.replace(/\[([^\]]+)\]/g, '"$1"');
 
-  // Remove dbo. prefix
+  // Remove any leftover bare dbo. prefix
   s = s.replace(/\bdbo\.\s*/gi, "");
 
   // N'string' → 'string'
