@@ -51,6 +51,10 @@ const DIALECT_LABELS: Record<SqlDialect, string> = {
 
 const MAX_FILE_SIZE = 1_000_000_000; // 1GB
 
+/** Files above this threshold skip client-side processing and upload directly
+ *  to the server for conversion + provisioning (prevents browser crashes). */
+const LARGE_FILE_THRESHOLD = 50_000_000; // 50MB
+
 export default function CustomThemeUpload({ existingThemes }: Props) {
   const [themes, setThemes] = useState<readonly CustomTheme[]>(existingThemes);
   const [isOpen, setIsOpen] = useState(false);
@@ -78,6 +82,11 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // Large file direct-upload state
+  const [largeFile, setLargeFile] = useState<File | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<string | null>(null);
+
   // CSV-specific state
   const [csvFiles, setCsvFiles] = useState<readonly CsvFile[]>([]);
   const [csvFileNames, setCsvFileNames] = useState<readonly string[]>([]);
@@ -104,6 +113,9 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
     setCsvFiles([]);
     setCsvFileNames([]);
     setCsvResult(null);
+    setLargeFile(null);
+    setIsUploading(false);
+    setUploadProgress(null);
   }, []);
 
   // -----------------------------------------------------------------------
@@ -114,6 +126,8 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
     setError(null);
     setConversionResult(null);
     setShowPreview(false);
+    setLargeFile(null);
+    setUploadProgress(null);
 
     const ext = file.name.split(".").pop()?.toLowerCase();
     if (ext !== "sql") {
@@ -127,7 +141,7 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
     if (file.size > MAX_FILE_SIZE) {
       setError(
         `File too large (${(file.size / 1_000_000).toFixed(1)}MB). ` +
-          `Maximum supported size is ${MAX_FILE_SIZE / 1_000_000}MB. ` +
+          `Maximum supported size is ${MAX_FILE_SIZE / 1_000_000_000}GB. ` +
           `Try removing comments or non-essential data from the dump.`
       );
       return;
@@ -137,6 +151,38 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
       return;
     }
 
+    // Auto-populate name/slug from filename
+    const baseName = file.name.replace(/\.sql$/i, "");
+    setName((prev) => prev || baseName.replace(/[_-]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()));
+    setSlug((prev) => prev || baseName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, ""));
+    setFileName(file.name);
+
+    // Large files: skip client-side processing entirely to avoid crashing the browser.
+    // Dialect detection uses only the first 8KB read as a small slice.
+    if (file.size > LARGE_FILE_THRESHOLD) {
+      setLargeFile(file);
+      // Read just the first 8KB for dialect detection (safe for any file size)
+      const slice = file.slice(0, 8192);
+      const peekReader = new FileReader();
+      peekReader.onload = (e) => {
+        const head = e.target?.result as string;
+        if (looksLikeBinary(head)) {
+          setError(
+            "This file appears to be a binary file, not a text-based SQL dump. " +
+              "Please export your database as a plain-text .sql file."
+          );
+          setLargeFile(null);
+          setFileName(null);
+          return;
+        }
+        const detection = detectDialect(head);
+        setSelectedDialect(detection.dialect);
+      };
+      peekReader.readAsText(slice);
+      return;
+    }
+
+    // Normal-sized files: read fully client-side
     const reader = new FileReader();
     reader.onerror = () => {
       setError("Could not read the file. Please try again or check the file is not corrupted.");
@@ -144,7 +190,6 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
     reader.onload = (e) => {
       const content = e.target?.result as string;
 
-      // Detect if this is actually a binary or non-text file
       if (looksLikeBinary(content)) {
         setError(
           "This file appears to be a binary file, not a text-based SQL dump. " +
@@ -153,7 +198,6 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
         return;
       }
 
-      // Detect if it looks more like CSV than SQL
       const csvCheck = detectCsvContent(content);
       if (csvCheck.isCsv && csvCheck.confidence > 0.7) {
         setError(
@@ -164,16 +208,9 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
       }
 
       setRawSql(content);
-      setFileName(file.name);
 
-      // Auto-detect dialect
       const detection = detectDialect(content);
       setSelectedDialect(detection.dialect);
-
-      // Auto-populate name/slug from filename if empty
-      const baseName = file.name.replace(/\.sql$/i, "");
-      setName((prev) => prev || baseName.replace(/[_-]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()));
-      setSlug((prev) => prev || baseName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, ""));
     };
     reader.readAsText(file);
   }, []);
@@ -412,7 +449,77 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
   }, [rawSql, selectedDialect, inputMode, csvFiles]);
 
   // -----------------------------------------------------------------------
-  // Submit
+  // Large file direct upload (server-side conversion + provisioning)
+  // -----------------------------------------------------------------------
+
+  const handleLargeFileUpload = useCallback(async () => {
+    if (!largeFile) return;
+    setError(null);
+    setSuccess(null);
+    setIsUploading(true);
+    setUploadProgress("Uploading file to server...");
+
+    try {
+      const formData = new FormData();
+      formData.append("file", largeFile);
+      formData.append("slug", slug.toLowerCase().replace(/\s+/g, "-"));
+      formData.append("name", name);
+      formData.append("description", description);
+      formData.append("dialect", selectedDialect);
+
+      setUploadProgress(
+        `Uploading ${(largeFile.size / 1_000_000).toFixed(0)}MB file... ` +
+          `Server will convert and provision automatically.`
+      );
+
+      const res = await fetch("/api/custom-themes/upload", {
+        method: "POST",
+        body: formData,
+      });
+
+      setUploadProgress("Processing server response...");
+
+      let data;
+      try {
+        data = await res.json();
+      } catch {
+        setError(
+          `Server returned status ${res.status} with no details. ` +
+            `The file may be too large to process. Try splitting it into smaller parts.`
+        );
+        return;
+      }
+
+      if (!res.ok) {
+        setError(data.error ?? `Server error (${res.status}). Please try again.`);
+        return;
+      }
+
+      setThemes((prev) => [data.theme, ...prev]);
+      const warningNote =
+        data.warnings?.length > 0
+          ? ` (${data.warnings.length} conversion warning${data.warnings.length > 1 ? "s" : ""})`
+          : "";
+      setSuccess(
+        `Theme "${name}" created and provisioned successfully!${warningNote} ` +
+          `It is now available for exercises.`
+      );
+      setIsOpen(false);
+      resetForm();
+    } catch (networkErr) {
+      const detail = networkErr instanceof Error ? networkErr.message : "";
+      setError(
+        `Upload failed${detail ? `: ${detail}` : ""}. ` +
+          `Check your connection and try again. For very large files, this may take a few minutes.`
+      );
+    } finally {
+      setIsUploading(false);
+      setUploadProgress(null);
+    }
+  }, [largeFile, slug, name, description, selectedDialect, resetForm]);
+
+  // -----------------------------------------------------------------------
+  // Submit (normal / small file flow)
   // -----------------------------------------------------------------------
 
   const handleSubmit = useCallback(
@@ -678,8 +785,8 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
                 )}
               </div>
 
-              {/* Dialect selector (shown after file upload) */}
-              {rawSql && (
+              {/* Dialect selector (shown after file upload or large file selected) */}
+              {(rawSql || largeFile) && (
                 <div>
                   <label className="block text-xs text-[var(--muted-foreground)] mb-1.5">
                     SQL Dialect (auto-detected, override if needed)
@@ -710,8 +817,46 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
                 </div>
               )}
 
-              {/* Convert button */}
-              {rawSql && !showPreview && (
+              {/* Large file: direct upload flow (no client-side preview) */}
+              {largeFile && (
+                <div className="space-y-3">
+                  <div className="p-3 bg-blue-500/10 border border-blue-500/20 rounded-md">
+                    <p className="text-xs text-blue-400 font-medium mb-1">
+                      Large file detected ({(largeFile.size / 1_000_000).toFixed(0)}MB)
+                    </p>
+                    <p className="text-[10px] text-blue-400/80">
+                      This file is too large for browser-side preview. It will be uploaded
+                      directly to the server for conversion and provisioning.
+                    </p>
+                  </div>
+
+                  {uploadProgress && (
+                    <div className="flex items-center gap-2 p-3 bg-[var(--background)] border border-[var(--border)] rounded-md">
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-[var(--cta)]" />
+                      <span className="text-xs text-[var(--muted-foreground)]">
+                        {uploadProgress}
+                      </span>
+                    </div>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={handleLargeFileUpload}
+                    disabled={isUploading || !slug.trim() || !name.trim()}
+                    className="flex items-center gap-1.5 px-4 py-2 text-xs bg-[var(--cta)] text-white rounded-md hover:opacity-90 transition-opacity disabled:opacity-50 cursor-pointer"
+                  >
+                    {isUploading ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <Upload className="w-3.5 h-3.5" />
+                    )}
+                    {isUploading ? "Uploading & Processing..." : "Upload & Create Theme"}
+                  </button>
+                </div>
+              )}
+
+              {/* Normal file: Convert button */}
+              {rawSql && !largeFile && !showPreview && (
                 <button
                   type="button"
                   onClick={handleConvert}
