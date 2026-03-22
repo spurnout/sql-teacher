@@ -7,6 +7,7 @@
  * dedicated PG schema with the sandbox_user role granted read-only access.
  */
 import { getAdminPool } from "@/lib/db/pool";
+import type { PoolClient } from "pg";
 
 const SLUG_REGEX = /^[a-z0-9][a-z0-9_-]{1,48}[a-z0-9]$/;
 
@@ -60,14 +61,15 @@ export interface ProvisionResult {
 }
 
 /**
- * Strip string-literal content from SQL so that data values inside INSERT
- * statements don't trigger blocked-pattern false positives.
+ * Strip quoted/comment content from SQL so that data values, quoted
+ * identifiers, and comments don't trigger blocked-pattern false positives.
  *
- * Replaces every '...' (handling '' escapes) with '' while preserving the
- * structural SQL keywords outside of strings.  This is a lightweight,
- * single-pass operation — O(n) with minimal allocations.
+ * Replaces every '...' with '', every "..." with "", and removes line/block
+ * comments while preserving structural SQL keywords outside those regions.
+ * This is a lightweight, single-pass operation — O(n) with minimal
+ * allocations.
  */
-function stripStringLiterals(sql: string): string {
+function stripQuotedAndCommentContent(sql: string): string {
   const parts: string[] = [];
   let i = 0;
   let segStart = 0;
@@ -89,6 +91,31 @@ function stripStringLiterals(sql: string): string {
           i++;
         }
       }
+      segStart = i;
+    } else if (sql[i] === '"') {
+      parts.push(sql.slice(segStart, i));
+      parts.push('""');
+      i++;
+      while (i < sql.length) {
+        if (sql[i] === '"' && i + 1 < sql.length && sql[i + 1] === '"') {
+          i += 2;
+        } else if (sql[i] === '"') {
+          i++;
+          break;
+        } else {
+          i++;
+        }
+      }
+      segStart = i;
+    } else if (sql[i] === "-" && i + 1 < sql.length && sql[i + 1] === "-") {
+      parts.push(sql.slice(segStart, i));
+      const eol = sql.indexOf("\n", i + 2);
+      i = eol === -1 ? sql.length : eol;
+      segStart = i;
+    } else if (sql[i] === "/" && i + 1 < sql.length && sql[i + 1] === "*") {
+      parts.push(sql.slice(segStart, i));
+      const end = sql.indexOf("*/", i + 2);
+      i = end === -1 ? sql.length : end + 2;
       segStart = i;
     } else {
       i++;
@@ -113,11 +140,95 @@ function validateProvisionSql(sql: string, label: string): string | null {
   }
 
   // Strip string literal content to avoid false positives from data values
-  const stripped = stripStringLiterals(sql);
+  const stripped = stripQuotedAndCommentContent(sql);
 
   for (const pattern of BLOCKED_SQL_PATTERNS) {
     if (pattern.test(stripped)) {
       return `${label} contains disallowed SQL statement: ${pattern.source}`;
+    }
+  }
+
+  return null;
+}
+
+interface ForeignKeyValidationTarget {
+  readonly constraintName: string;
+  readonly childSchema: string;
+  readonly childTable: string;
+  readonly parentSchema: string;
+  readonly parentTable: string;
+  readonly childColumns: readonly string[];
+  readonly parentColumns: readonly string[];
+}
+
+function quoteIdent(identifier: string): string {
+  return `"${identifier.replace(/"/g, '""')}"`;
+}
+
+function qualifiedTable(schema: string, table: string): string {
+  return `${quoteIdent(schema)}.${quoteIdent(table)}`;
+}
+
+async function validateForeignKeys(
+  client: PoolClient,
+  schemaName: string,
+): Promise<string | null> {
+  const { rows } = await client.query<ForeignKeyValidationTarget>(
+    `
+      SELECT
+        c.conname AS "constraintName",
+        child_ns.nspname AS "childSchema",
+        child_cls.relname AS "childTable",
+        parent_ns.nspname AS "parentSchema",
+        parent_cls.relname AS "parentTable",
+        array_agg(child_att.attname ORDER BY cols.ord) AS "childColumns",
+        array_agg(parent_att.attname ORDER BY cols.ord) AS "parentColumns"
+      FROM pg_constraint c
+      JOIN pg_class child_cls ON child_cls.oid = c.conrelid
+      JOIN pg_namespace child_ns ON child_ns.oid = child_cls.relnamespace
+      JOIN pg_class parent_cls ON parent_cls.oid = c.confrelid
+      JOIN pg_namespace parent_ns ON parent_ns.oid = parent_cls.relnamespace
+      JOIN LATERAL unnest(c.conkey, c.confkey) WITH ORDINALITY AS cols(child_attnum, parent_attnum, ord) ON TRUE
+      JOIN pg_attribute child_att ON child_att.attrelid = child_cls.oid AND child_att.attnum = cols.child_attnum
+      JOIN pg_attribute parent_att ON parent_att.attrelid = parent_cls.oid AND parent_att.attnum = cols.parent_attnum
+      WHERE c.contype = 'f'
+        AND child_ns.nspname = $1
+      GROUP BY c.conname, child_ns.nspname, child_cls.relname, parent_ns.nspname, parent_cls.relname
+      ORDER BY child_cls.relname, c.conname
+    `,
+    [schemaName],
+  );
+
+  for (const fk of rows) {
+    const child = "child";
+    const parent = "parent";
+    const nonNullChecks = fk.childColumns
+      .map((column: string) => `${child}.${quoteIdent(column)} IS NOT NULL`)
+      .join(" AND ");
+    const joinChecks = fk.childColumns
+      .map(
+        (column: string, index: number) =>
+          `${child}.${quoteIdent(column)} IS NOT DISTINCT FROM ${parent}.${quoteIdent(
+            fk.parentColumns[index],
+          )}`,
+      )
+      .join(" AND ");
+
+    const validationSql = `
+      SELECT 1
+      FROM ${qualifiedTable(fk.childSchema, fk.childTable)} AS ${child}
+      WHERE ${nonNullChecks}
+        AND NOT EXISTS (
+          SELECT 1
+          FROM ${qualifiedTable(fk.parentSchema, fk.parentTable)} AS ${parent}
+          WHERE ${joinChecks}
+        )
+      LIMIT 1
+    `;
+
+    const violation = await client.query(validationSql);
+    if (violation.rowCount && violation.rowCount > 0) {
+      return `Seed data violates foreign key "${fk.constraintName}" on ${fk.childTable}`;
     }
   }
 
@@ -166,9 +277,10 @@ export async function provisionCustomTheme(
     await client.query(`SET LOCAL search_path = '"${schemaName}"', public`);
     await client.query(schemaSql);
 
-    // Disable FK checks during seed import — SSMS exports don't guarantee
-    // INSERT order matches foreign key dependencies.  replica role tells
-    // PostgreSQL to skip all FK / CHECK / NOT NULL trigger enforcement.
+    // Disable FK triggers during seed import — SSMS exports don't guarantee
+    // INSERT order matches foreign key dependencies. `replica` skips FK
+    // enforcement implemented by triggers, so we run an explicit FK scan after
+    // switching back to origin.
     await client.query(
       "SET LOCAL session_replication_role = 'replica'"
     );
@@ -180,6 +292,11 @@ export async function provisionCustomTheme(
     await client.query(
       "SET LOCAL session_replication_role = 'origin'"
     );
+
+    const foreignKeyError = await validateForeignKeys(client, schemaName);
+    if (foreignKeyError) {
+      throw new Error(foreignKeyError);
+    }
 
     // Grant sandbox_user read access
     await client.query(`SET LOCAL search_path = 'public'`);

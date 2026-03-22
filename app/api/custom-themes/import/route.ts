@@ -15,7 +15,11 @@ import {
   provisionCustomTheme,
   deprovisionCustomTheme,
 } from "@/lib/themes/provisioner";
-import { convertSql, type SqlDialect } from "@/lib/themes/sql-converter";
+import {
+  convertSql,
+  splitSqlServerDump,
+  type SqlDialect,
+} from "@/lib/themes/sql-converter";
 import { generateSchemaRef } from "@/lib/themes/schema-parser";
 import type { SchemaReference } from "@/content/schema/reference";
 
@@ -218,7 +222,7 @@ export async function POST(req: NextRequest) {
     if (isLarge) {
       console.log(`[import] Large file (${fileSizeMB}MB) — splitting DDL and seed before conversion...`);
       const splitStart = Date.now();
-      const { ddlPart, seedPart } = splitDdlAndSeed(rawSql);
+      const { ddlPart, seedPart } = splitDdlAndSeed(rawSql, dialect as SqlDialect);
       // Release the full raw string ASAP to free memory
       rawSql = "";
       console.log(
@@ -426,7 +430,28 @@ function humanizeProvisionError(raw: string): string {
 // Split DDL (CREATE/ALTER) from seed (INSERT) for memory-efficient processing
 // ---------------------------------------------------------------------------
 
-function splitDdlAndSeed(sql: string): { ddlPart: string; seedPart: string } {
+function splitDdlAndSeed(
+  sql: string,
+  dialect: SqlDialect,
+): { ddlPart: string; seedPart: string } {
+  if (dialect === "sqlserver") {
+    const ddlChunks: string[] = [];
+    const seedChunks: string[] = [];
+
+    for (const chunk of splitSqlServerDump(sql.replace(/\r\n/g, "\n"))) {
+      if (chunk.kind === "seed") {
+        seedChunks.push(chunk.text);
+      } else {
+        ddlChunks.push(chunk.text);
+      }
+    }
+
+    return {
+      ddlPart: ddlChunks.join("\n\n"),
+      seedPart: seedChunks.join("\n\n"),
+    };
+  }
+
   const ddlLines: string[] = [];
   const seedLines: string[] = [];
 
@@ -539,9 +564,11 @@ function detectEncoding(buffer: Buffer): "utf-8" | "utf-16le" | "utf-16be" {
 // ---------------------------------------------------------------------------
 
 /**
- * For very large seed portions (400MB+), the full converter's character-by-
- * character `splitStatements` is too expensive. This function does direct
- * line-by-line regex conversion without building intermediate arrays.
+ * For very large seed portions (400MB+), the full converter's general-purpose
+ * statement splitter is too expensive. This function walks SQL Server dump
+ * chunks with the shared scanner and rewrites only real top-level INSERT
+ * statements, without reprocessing stored procedure bodies or breaking on
+ * multi-line string literals.
  *
  * It handles the most critical SQL Server → PostgreSQL transformations
  * that appear in INSERT statements:
@@ -550,7 +577,7 @@ function detectEncoding(buffer: Buffer): "utf-8" | "utf-16le" | "utf-16be" {
  * - N'string' → 'string'
  * - CAST(N'...' AS DateTime) → '...'::TIMESTAMP
  * - INSERT [table] → INSERT INTO table
- * - GO delimiter → semicolons
+ * - safe semicolon insertion between top-level INSERT statements
  */
 function convertSeedLightweight(seed: string, dialect: string): string {
   if (dialect !== "sqlserver") {
@@ -558,96 +585,42 @@ function convertSeedLightweight(seed: string, dialect: string): string {
     return seed.replace(/\r\n/g, "\n");
   }
 
-  const lines = seed.split("\n");
   const result: string[] = [];
-  // Track when we're inside a skipped block (e.g., stored procedure body
-  // that leaked into seed because it contains INSERT into @variables)
-  let skipCurrentBlock = false;
 
-  for (const rawLine of lines) {
-    let line = rawLine;
+  for (const chunk of splitSqlServerDump(seed.replace(/\r\n/g, "\n"))) {
+    if (chunk.kind !== "seed") continue;
 
-    // Skip empty lines and SQL Server noise
-    const trimmed = line.trimStart();
-    if (!trimmed) continue;
+    let statement = chunk.text;
 
-    const upper = trimmed.slice(0, 10).toUpperCase();
-    if (upper.startsWith("SET ") || upper.startsWith("GO")) continue;
+    // Remove [dbo]. prefix BEFORE bracket-to-quote conversion
+    statement = statement.replace(/\[dbo\]\.\s*/gi, "");
+    // Convert [bracket] quoting to "double-quoted" identifiers (preserves reserved words)
+    statement = statement.replace(/\[([^\]]+)\]/g, '"$1"');
+    // Remove any leftover bare dbo. prefix
+    statement = statement.replace(/\bdbo\.\s*/gi, "");
+    // N'string' → 'string'  (greedy — lazy *? breaks on escaped '' like N'can''t')
+    statement = statement.replace(/\bN'((?:[^']|'')*)'/g, "'$1'");
+    // CAST(N'...' AS DateTime) → '...'::TIMESTAMP (N already stripped above)
+    statement = statement.replace(
+      /\bCAST\s*\(\s*'([^']*)'\s+AS\s+(?:DateTime2?|SmallDateTime|Date)\s*\)/gi,
+      "'$1'::TIMESTAMP"
+    );
+    // CAST(value AS Decimal/Numeric(...)) → just the value
+    statement = statement.replace(
+      /\bCAST\s*\(\s*([.\d]+)\s+AS\s+(?:Decimal|Numeric)\s*\(\s*\d+\s*,\s*\d+\s*\)\s*\)/gi,
+      "$1"
+    );
+    // GETDATE() → NOW()
+    statement = statement.replace(/\bGETDATE\s*\(\s*\)/gi, "NOW()");
+    // ISNULL(x, y) → COALESCE(x, y)
+    statement = statement.replace(/\bISNULL\s*\(/gi, "COALESCE(");
+    // 0xHEX binary literals → decode('HEX','hex')
+    statement = statement.replace(/\b0x([0-9A-Fa-f]{2,})\b/g, "decode('$1','hex')");
+    // Ensure INSERT INTO (SQL Server omits INTO)
+    statement = statement.replace(/^(\s*)INSERT\s+(?!INTO\b)/i, "$1INSERT INTO ");
 
-    // Only process INSERT lines and their continuations
-    if (upper.startsWith("INSERT")) {
-      // Skip INSERT statements from stored procedure bodies that leaked into
-      // seed data. These target @table_variables or #temp_tables — they are
-      // T-SQL procedural code, not real data.
-      if (/\bINSERT\s+(?:INTO\s+)?[@#]/i.test(trimmed)) {
-        skipCurrentBlock = true;
-        continue;
-      }
-      skipCurrentBlock = false;
-
-      // Terminate the previous statement before starting a new INSERT.
-      // In SSMS exports, GO delimits statements, but we stripped those —
-      // PostgreSQL needs semicolons between statements.
-      if (result.length > 0) {
-        const lastIdx = result.length - 1;
-        const last = result[lastIdx].trimEnd();
-        if (!last.endsWith(";")) result[lastIdx] = last + ";";
-      }
-
-      // Remove [dbo]. prefix BEFORE bracket-to-quote conversion
-      line = line.replace(/\[dbo\]\.\s*/gi, "");
-      // Convert [bracket] quoting to "double-quoted" identifiers (preserves reserved words)
-      line = line.replace(/\[([^\]]+)\]/g, '"$1"');
-      // N'string' → 'string'  (greedy — lazy *? breaks on escaped '' like N'can''t')
-      line = line.replace(/\bN'((?:[^']|'')*)'/g, "'$1'");
-      // CAST(N'...' AS DateTime) → '...'::TIMESTAMP (N already stripped above)
-      line = line.replace(
-        /\bCAST\s*\(\s*'([^']*)'\s+AS\s+(?:DateTime2?|SmallDateTime|Date)\s*\)/gi,
-        "'$1'::TIMESTAMP"
-      );
-      // CAST(value AS Decimal/Numeric(...)) → just the value
-      line = line.replace(
-        /\bCAST\s*\(\s*([.\d]+)\s+AS\s+(?:Decimal|Numeric)\s*\(\s*\d+\s*,\s*\d+\s*\)\s*\)/gi,
-        "$1"
-      );
-      // GETDATE() → NOW()
-      line = line.replace(/\bGETDATE\s*\(\s*\)/gi, "NOW()");
-      // ISNULL(x, y) → COALESCE(x, y)
-      line = line.replace(/\bISNULL\s*\(/gi, "COALESCE(");
-      // 0xHEX binary literals → decode('HEX','hex')
-      line = line.replace(/\b0x([0-9A-Fa-f]{2,})\b/g, "decode('$1','hex')");
-      // Ensure INSERT INTO (SQL Server omits INTO)
-      line = line.replace(/^(\s*)INSERT\s+(?!INTO\b)/i, "$1INSERT INTO ");
-    } else if (skipCurrentBlock) {
-      // Skip continuation lines of a stored-proc INSERT that we're filtering out
-      continue;
-    } else {
-      // Continuation line (e.g. VALUES rows in multi-line INSERT statements).
-      // Apply the same SQL Server→PG data transformations as the INSERT header.
-      line = line.replace(/\[dbo\]\.\s*/gi, "");
-      line = line.replace(/\[([^\]]+)\]/g, '"$1"');
-      line = line.replace(/\bN'((?:[^']|'')*)'/g, "'$1'");
-      line = line.replace(
-        /\bCAST\s*\(\s*'([^']*)'\s+AS\s+(?:DateTime2?|SmallDateTime|Date)\s*\)/gi,
-        "'$1'::TIMESTAMP"
-      );
-      line = line.replace(
-        /\bCAST\s*\(\s*([.\d]+)\s+AS\s+(?:Decimal|Numeric)\s*\(\s*\d+\s*,\s*\d+\s*\)\s*\)/gi,
-        "$1"
-      );
-      line = line.replace(/\bGETDATE\s*\(\s*\)/gi, "NOW()");
-      line = line.replace(/\bISNULL\s*\(/gi, "COALESCE(");
-      line = line.replace(/\b0x([0-9A-Fa-f]{2,})\b/g, "decode('$1','hex')");
-    }
-
-    result.push(line);
-  }
-
-  // Terminate the final statement
-  if (result.length > 0) {
-    const lastIdx = result.length - 1;
-    const last = result[lastIdx].trimEnd();
-    if (!last.endsWith(";")) result[lastIdx] = last + ";";
+    const normalized = statement.trimEnd().replace(/;+\s*$/g, "");
+    result.push(normalized + ";");
   }
 
   return result.join("\n");

@@ -244,6 +244,183 @@ function classifyStatement(stmt: string): StatementKind {
   return "skip";
 }
 
+export type SqlServerChunkKind = "ddl" | "seed";
+
+export interface SqlServerChunk {
+  readonly text: string;
+  readonly kind: SqlServerChunkKind;
+}
+
+interface SqlServerScanState {
+  readonly inString: boolean;
+  readonly inBlockComment: boolean;
+}
+
+interface SqlServerLineStart {
+  readonly kind: SqlServerChunkKind;
+  readonly opensRoutineBatch: boolean;
+}
+
+function detectSqlServerLineStart(trimmedLine: string): SqlServerLineStart | null {
+  if (!trimmedLine || trimmedLine.startsWith("--")) {
+    return null;
+  }
+
+  if (/^INSERT\b/i.test(trimmedLine)) {
+    if (/\bINSERT\s+(?:INTO\s+)?[@#]/i.test(trimmedLine)) {
+      return { kind: "ddl", opensRoutineBatch: false };
+    }
+    return { kind: "seed", opensRoutineBatch: false };
+  }
+
+  if (
+    /^(?:CREATE|ALTER)\s+(?:OR\s+ALTER\s+)?(?:PROC(?:EDURE)?|FUNCTION|VIEW|TRIGGER)\b/i.test(
+      trimmedLine,
+    )
+  ) {
+    return { kind: "ddl", opensRoutineBatch: true };
+  }
+
+  if (
+    /^(?:CREATE|ALTER|SET|USE|IF|BEGIN|END|PRINT|EXEC(?:UTE)?|DROP|SELECT|UPDATE|DELETE|MERGE)\b/i.test(
+      trimmedLine,
+    )
+  ) {
+    return { kind: "ddl", opensRoutineBatch: false };
+  }
+
+  return null;
+}
+
+function advanceSqlServerScanState(
+  line: string,
+  state: SqlServerScanState,
+): SqlServerScanState {
+  let { inString, inBlockComment } = state;
+
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    const next = i + 1 < line.length ? line[i + 1] : "";
+
+    if (inString) {
+      if (ch === "'" && next === "'") {
+        i++;
+      } else if (ch === "'") {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (inBlockComment) {
+      if (ch === "*" && next === "/") {
+        inBlockComment = false;
+        i++;
+      }
+      continue;
+    }
+
+    if (ch === "-" && next === "-") {
+      break;
+    }
+
+    if (ch === "/" && next === "*") {
+      inBlockComment = true;
+      i++;
+      continue;
+    }
+
+    if (ch === "'") {
+      inString = true;
+    }
+  }
+
+  return { inString, inBlockComment };
+}
+
+function pushSqlServerChunk(
+  sql: string,
+  chunks: SqlServerChunk[],
+  start: number,
+  end: number,
+  kind: SqlServerChunkKind | null,
+): void {
+  if (kind === null || end <= start) {
+    return;
+  }
+
+  const text = sql.slice(start, end).trim();
+  if (text.length === 0) {
+    return;
+  }
+
+  chunks.push({ text, kind });
+}
+
+/**
+ * Split a SQL Server dump into top-level chunks without breaking on multi-line
+ * string literals or procedure bodies.
+ *
+ * SSMS exports often omit semicolons between INSERT statements and instead rely
+ * on line starts / GO batch separators. This scanner understands those rules
+ * well enough to isolate real seed INSERTs from CREATE/ALTER batches.
+ */
+export function splitSqlServerDump(sql: string): readonly SqlServerChunk[] {
+  const chunks: SqlServerChunk[] = [];
+  let pos = 0;
+  let chunkStart = -1;
+  let chunkKind: SqlServerChunkKind | null = null;
+  let inRoutineBatch = false;
+  let state: SqlServerScanState = { inString: false, inBlockComment: false };
+
+  while (pos < sql.length) {
+    const lineStart = pos;
+    let lineEnd = sql.indexOf("\n", pos);
+    if (lineEnd === -1) {
+      lineEnd = sql.length;
+    }
+    const nextPos = lineEnd < sql.length ? lineEnd + 1 : lineEnd;
+
+    let line = sql.slice(lineStart, lineEnd);
+    if (line.endsWith("\r")) {
+      line = line.slice(0, -1);
+    }
+
+    const canClassifyLine = !state.inString && !state.inBlockComment;
+    const trimmedLine = canClassifyLine ? line.trimStart() : "";
+
+    if (canClassifyLine && /^GO\s*(?:--.*)?$/i.test(trimmedLine)) {
+      pushSqlServerChunk(sql, chunks, chunkStart, lineStart, chunkKind);
+      chunkStart = -1;
+      chunkKind = null;
+      inRoutineBatch = false;
+      pos = nextPos;
+      continue;
+    }
+
+    if (canClassifyLine && !inRoutineBatch) {
+      const lineStartInfo = detectSqlServerLineStart(trimmedLine);
+      if (lineStartInfo) {
+        pushSqlServerChunk(sql, chunks, chunkStart, lineStart, chunkKind);
+        chunkStart = lineStart;
+        chunkKind = lineStartInfo.kind;
+        inRoutineBatch = lineStartInfo.opensRoutineBatch;
+      } else if (chunkStart === -1 && trimmedLine.length > 0) {
+        chunkStart = lineStart;
+        chunkKind = "ddl";
+      }
+    } else if (chunkStart === -1 && line.trim().length > 0) {
+      chunkStart = lineStart;
+      chunkKind = "ddl";
+    }
+
+    state = advanceSqlServerScanState(line, state);
+    pos = nextPos;
+  }
+
+  pushSqlServerChunk(sql, chunks, chunkStart, sql.length, chunkKind);
+  return chunks;
+}
+
 // ---------------------------------------------------------------------------
 // Converters
 // ---------------------------------------------------------------------------
@@ -663,9 +840,6 @@ function convertSqlServer(rawSql: string): ConversionResult {
 
   let sql = rawSql.replace(/\r\n/g, "\n");
 
-  // Replace GO batch separators with semicolons so splitStatements can find boundaries
-  sql = sql.replace(/^\s*GO\s*$/gim, ";");
-
   // Remove SET statements (SET ANSI_NULLS, SET QUOTED_IDENTIFIER, etc.)
   sql = sql.replace(
     /^\s*SET\s+(IDENTITY_INSERT|NOCOUNT|ANSI_NULLS|QUOTED_IDENTIFIER|ANSI_PADDING|ANSI_WARNINGS|CONCAT_NULL_YIELDS_NULL|ARITHABORT|NUMERIC_ROUNDABORT)\b[^;]*;?\s*$/gim,
@@ -679,28 +853,24 @@ function convertSqlServer(rawSql: string): ConversionResult {
   // These can span multiple lines, so use [\s\S] instead of . to match newlines.
   sql = sql.replace(/\/\*{5,}[\s\S]*?\*{5,}\//g, "");
 
-  // splitStatements with backslashEscape=false — SQL Server does NOT use \'
-  // as an escape sequence.  Backslash is a literal character (e.g. file paths
-  // in CREATE DATABASE, string manipulation in functions).
-  const stmts = splitStatements(sql);
   const ddlParts: string[] = [];
   const seedParts: string[] = [];
   let skippedCount = 0;
 
-  for (const stmt of stmts) {
-    const kind = classifyStatement(stmt);
-    if (kind === "ddl") {
-      const converted = convertSqlServerDdl(stmt, warnings);
-      if (converted) ddlParts.push(converted + ";");
-    } else if (kind === "seed") {
-      seedParts.push(convertSqlServerDml(stmt) + ";");
+  for (const chunk of splitSqlServerDump(sql)) {
+    const statementKind = chunk.kind === "seed" ? "seed" : classifyStatement(chunk.text);
+    if (statementKind === "ddl") {
+      const converted = convertSqlServerDdl(chunk.text, warnings);
+      if (converted) ddlParts.push(converted.replace(/;+\s*$/g, "") + ";");
+    } else if (statementKind === "seed") {
+      seedParts.push(convertSqlServerDml(chunk.text).replace(/;+\s*$/g, "") + ";");
     } else {
-      if (stmt.trim().length > 0) {
-        skippedCount++;
-        // Only log first few skipped statements to avoid thousands of warnings
-        if (skippedCount <= 10) {
-          warnings.push(`Skipped: ${stmt.slice(0, 80)}${stmt.length > 80 ? "..." : ""}`);
-        }
+      skippedCount++;
+      // Only log first few skipped statements to avoid thousands of warnings
+      if (skippedCount <= 10) {
+        warnings.push(
+          `Skipped: ${chunk.text.slice(0, 80)}${chunk.text.length > 80 ? "..." : ""}`,
+        );
       }
     }
   }
