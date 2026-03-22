@@ -553,6 +553,9 @@ function convertSeedLightweight(seed: string, dialect: string): string {
 
   const lines = seed.split("\n");
   const result: string[] = [];
+  // Track when we're inside a skipped block (e.g., stored procedure body
+  // that leaked into seed because it contains INSERT into @variables)
+  let skipCurrentBlock = false;
 
   for (const rawLine of lines) {
     let line = rawLine;
@@ -566,6 +569,15 @@ function convertSeedLightweight(seed: string, dialect: string): string {
 
     // Only process INSERT lines and their continuations
     if (upper.startsWith("INSERT")) {
+      // Skip INSERT statements from stored procedure bodies that leaked into
+      // seed data. These target @table_variables or use INSERT...SELECT rather
+      // than INSERT...VALUES.  They are T-SQL, not data.
+      if (/\bINSERT\s+(?:INTO\s+)?@/i.test(trimmed)) {
+        skipCurrentBlock = true;
+        continue;
+      }
+      skipCurrentBlock = false;
+
       // Terminate the previous statement before starting a new INSERT.
       // In SSMS exports, GO delimits statements, but we stripped those —
       // PostgreSQL needs semicolons between statements.
@@ -593,6 +605,9 @@ function convertSeedLightweight(seed: string, dialect: string): string {
       );
       // Ensure INSERT INTO (SQL Server omits INTO)
       line = line.replace(/^(\s*)INSERT\s+(?!INTO\b)/i, "$1INSERT INTO ");
+    } else if (skipCurrentBlock) {
+      // Skip continuation lines of a stored-proc INSERT that we're filtering out
+      continue;
     }
 
     result.push(line);
