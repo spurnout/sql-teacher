@@ -60,16 +60,63 @@ export interface ProvisionResult {
 }
 
 /**
+ * Strip string-literal content from SQL so that data values inside INSERT
+ * statements don't trigger blocked-pattern false positives.
+ *
+ * Replaces every '...' (handling '' escapes) with '' while preserving the
+ * structural SQL keywords outside of strings.  This is a lightweight,
+ * single-pass operation — O(n) with minimal allocations.
+ */
+function stripStringLiterals(sql: string): string {
+  const parts: string[] = [];
+  let i = 0;
+  let segStart = 0;
+
+  while (i < sql.length) {
+    if (sql[i] === "'") {
+      // Emit everything before this quote
+      parts.push(sql.slice(segStart, i));
+      parts.push("''"); // placeholder for the removed string content
+      // Skip past the closing quote
+      i++;
+      while (i < sql.length) {
+        if (sql[i] === "'" && i + 1 < sql.length && sql[i + 1] === "'") {
+          i += 2; // skip escaped ''
+        } else if (sql[i] === "'") {
+          i++; // closing quote
+          break;
+        } else {
+          i++;
+        }
+      }
+      segStart = i;
+    } else {
+      i++;
+    }
+  }
+
+  parts.push(sql.slice(segStart));
+  return parts.join("");
+}
+
+/**
  * Validate that user-provided SQL only contains safe DDL/DML statements.
  * Returns an error message if unsafe, or null if safe.
+ *
+ * String literals are stripped before pattern-matching to avoid false
+ * positives from data values (e.g. a product named "LEMON DROP" triggering
+ * the DROP pattern).
  */
 function validateProvisionSql(sql: string, label: string): string | null {
   if (sql.length > MAX_SQL_LENGTH) {
     return `${label} exceeds maximum length (${MAX_SQL_LENGTH} characters)`;
   }
 
+  // Strip string literal content to avoid false positives from data values
+  const stripped = stripStringLiterals(sql);
+
   for (const pattern of BLOCKED_SQL_PATTERNS) {
-    if (pattern.test(sql)) {
+    if (pattern.test(stripped)) {
       return `${label} contains disallowed SQL statement: ${pattern.source}`;
     }
   }
