@@ -201,6 +201,11 @@ function classifyStatement(stmt: string): StatementKind {
     upper.startsWith("CREATE TABLE") ||
     upper.startsWith("CREATE INDEX") ||
     upper.startsWith("CREATE UNIQUE INDEX") ||
+    // SQL Server uses CLUSTERED/NONCLUSTERED before INDEX
+    upper.startsWith("CREATE CLUSTERED INDEX") ||
+    upper.startsWith("CREATE NONCLUSTERED INDEX") ||
+    upper.startsWith("CREATE UNIQUE CLUSTERED INDEX") ||
+    upper.startsWith("CREATE UNIQUE NONCLUSTERED INDEX") ||
     upper.startsWith("ALTER TABLE")
   ) {
     return "ddl";
@@ -278,7 +283,7 @@ function preflightCheck(rawSql: string): string | null {
   // Check for at least one SQL keyword in the first 5KB
   const head = rawSql.slice(0, 5000).toUpperCase();
   const hasSqlKeyword =
-    /\b(CREATE\s+TABLE|INSERT\s+INTO|ALTER\s+TABLE|DROP\s+TABLE|SELECT\b|BEGIN|PRAGMA)\b/.test(head);
+    /\b(CREATE\s+TABLE|CREATE\s+(UNIQUE\s+)?(NON)?CLUSTERED\s+INDEX|CREATE\s+INDEX|INSERT\s+INTO|INSERT\s+\[|ALTER\s+TABLE|DROP\s+TABLE|SELECT\b|BEGIN|PRAGMA)\b/.test(head);
   if (!hasSqlKeyword) {
     // Check if it looks like CSV — use a stricter heuristic:
     // consistent delimiter-separated fields across multiple lines
@@ -633,18 +638,22 @@ function convertSqlServer(rawSql: string): ConversionResult {
   // Replace GO batch separators with semicolons so splitStatements can find boundaries
   sql = sql.replace(/^\s*GO\s*$/gim, ";");
 
-  // Remove SET statements
+  // Remove SET statements (SET ANSI_NULLS, SET QUOTED_IDENTIFIER, etc.)
   sql = sql.replace(
-    /^\s*SET\s+(IDENTITY_INSERT|NOCOUNT|ANSI_NULLS|QUOTED_IDENTIFIER|ANSI_PADDING|ANSI_WARNINGS|CONCAT_NULL_YIELDS_NULL|ARITHABORT)\b[^;]*;?\s*$/gim,
+    /^\s*SET\s+(IDENTITY_INSERT|NOCOUNT|ANSI_NULLS|QUOTED_IDENTIFIER|ANSI_PADDING|ANSI_WARNINGS|CONCAT_NULL_YIELDS_NULL|ARITHABORT|NUMERIC_ROUNDABORT)\b[^;]*;?\s*$/gim,
     ""
   );
 
   // Remove USE [database]
   sql = sql.replace(/^\s*USE\s+\[?\w+\]?\s*;?\s*$/gim, "");
 
+  // Remove SSMS script comment headers: /****** Object: ... Script Date: ... ******/
+  sql = sql.replace(/\/\*{5,}\s*Object:.*?\*{5,}\//g, "");
+
   const stmts = splitStatements(sql);
   const ddlParts: string[] = [];
   const seedParts: string[] = [];
+  let skippedCount = 0;
 
   for (const stmt of stmts) {
     const kind = classifyStatement(stmt);
@@ -654,9 +663,17 @@ function convertSqlServer(rawSql: string): ConversionResult {
       seedParts.push(convertSqlServerDml(stmt) + ";");
     } else {
       if (stmt.trim().length > 0) {
-        warnings.push(`Skipped: ${stmt.slice(0, 60)}...`);
+        skippedCount++;
+        // Only log first few skipped statements to avoid thousands of warnings
+        if (skippedCount <= 10) {
+          warnings.push(`Skipped: ${stmt.slice(0, 80)}${stmt.length > 80 ? "..." : ""}`);
+        }
       }
     }
+  }
+
+  if (skippedCount > 10) {
+    warnings.push(`...and ${skippedCount - 10} more skipped statements (views, functions, procedures, etc.)`);
   }
 
   return {
@@ -670,77 +687,117 @@ function convertSqlServer(rawSql: string): ConversionResult {
 function convertSqlServerDdl(stmt: string, _warnings: string[]): string {
   let s = stmt;
 
-  // Remove [bracket] quoting
-  s = s.replace(/\[(\w+)\]/g, "$1");
+  // ── Phase 1: Storage directives (brackets still present) ──
+  // Filegroup refs use ON [PRIMARY] (single bracketed word not followed by .[),
+  // while table refs use ON [dbo].[table] (schema-qualified with dots).
 
-  // Remove dbo. prefix
-  s = s.replace(/\bdbo\.\s*/gi, "");
+  // Remove TEXTIMAGE_ON [filegroup]
+  s = s.replace(/\bTEXTIMAGE_ON\s+\[\w+\]/gi, "");
+
+  // Remove ) ON [filegroup] — not followed by .[ (schema.table)
+  s = s.replace(/\)\s*ON\s+\[\w+\](?!\s*\.\s*\[)/gim, ")");
+  // Remove standalone ON [filegroup] at end of line
+  s = s.replace(/\bON\s+\[\w+\](?!\s*\.\s*\[)\s*$/gim, "");
+
+  // Remove INCLUDE([...]) covering index columns
+  s = replaceBalancedParen(s, /\bINCLUDE\s*\(/gi);
+
+  // Remove WITH (PAD_INDEX = ..., ...) storage option clauses
+  s = replaceBalancedParen(s, /\bWITH\s*\(/gi);
+
+  // ── Phase 2: Type conversions using positional matching ──
+  // In SQL Server DDL, column defs follow the pattern: [col_name] [type_name].
+  // By matching `] [type]` (type after column name's closing bracket), we avoid
+  // accidentally converting column names that match SQL keywords — e.g. a
+  // column named [DateTime] won't be converted, but the type [datetime] will.
+  //
+  // Pattern: (]) followed by whitespace then [type], preserving the `]` in $1.
 
   // IDENTITY(1,1) on integer columns → SERIAL
   s = s.replace(
-    /\b(INT|INTEGER|BIGINT|SMALLINT)\s+IDENTITY\s*\(\s*\d+\s*,\s*\d+\s*\)/gi,
-    (match) => {
-      if (/BIGINT/i.test(match)) return "BIGSERIAL";
-      if (/SMALLINT/i.test(match)) return "SMALLSERIAL";
-      return "SERIAL";
+    /(\])\s+\[(INT|INTEGER|BIGINT|SMALLINT)\]\s+IDENTITY\s*\(\s*\d+\s*,\s*\d+\s*\)/gi,
+    (_match, bracket, typeName) => {
+      if (/BIGINT/i.test(typeName)) return bracket + " BIGSERIAL";
+      if (/SMALLINT/i.test(typeName)) return bracket + " SMALLSERIAL";
+      return bracket + " SERIAL";
     }
   );
 
-  // NVARCHAR(MAX) → TEXT
-  s = s.replace(/\bNVARCHAR\s*\(\s*MAX\s*\)/gi, "TEXT");
-  // NVARCHAR(N) → VARCHAR(N)
-  s = s.replace(/\bNVARCHAR\s*\((\d+)\)/gi, "VARCHAR($1)");
-  // VARCHAR(MAX) → TEXT
-  s = s.replace(/\bVARCHAR\s*\(\s*MAX\s*\)/gi, "TEXT");
-  // NTEXT → TEXT
-  s = s.replace(/\bNTEXT\b/gi, "TEXT");
-  // NCHAR(N) → CHAR(N)
-  s = s.replace(/\bNCHAR\s*\((\d+)\)/gi, "CHAR($1)");
+  // String types
+  s = s.replace(/(\])\s+\[nvarchar\]\s*\(\s*MAX\s*\)/gi, "$1 TEXT");
+  s = s.replace(/(\])\s+\[nvarchar\]\s*\((\d+)\)/gi, "$1 VARCHAR($2)");
+  s = s.replace(/(\])\s+\[varchar\]\s*\(\s*MAX\s*\)/gi, "$1 TEXT");
+  s = s.replace(/(\])\s+\[varchar\]\s*\((\d+)\)/gi, "$1 VARCHAR($2)");
+  s = s.replace(/(\])\s+\[ntext\]/gi, "$1 TEXT");
+  s = s.replace(/(\])\s+\[nchar\]\s*\((\d+)\)/gi, "$1 CHAR($2)");
+  s = s.replace(/(\])\s+\[char\]\s*\((\d+)\)/gi, "$1 CHAR($2)");
+  s = s.replace(/(\])\s+\[text\]/gi, "$1 TEXT");
+  s = s.replace(/(\])\s+\[xml\]/gi, "$1 TEXT");
+  s = s.replace(/(\])\s+\[sql_variant\]/gi, "$1 TEXT");
 
-  // BIT → BOOLEAN
-  s = s.replace(/\bBIT\b/gi, "BOOLEAN");
+  // Boolean
+  s = s.replace(/(\])\s+\[bit\]/gi, "$1 BOOLEAN");
 
-  // DATETIME / DATETIME2 → TIMESTAMP
-  s = s.replace(/\bDATETIME2?\b(\s*\(\s*\d+\s*\))?/gi, "TIMESTAMP");
-  // SMALLDATETIME → TIMESTAMP
-  s = s.replace(/\bSMALLDATETIME\b/gi, "TIMESTAMP");
+  // Date/time
+  s = s.replace(/(\])\s+\[datetime2\](\s*\(\s*\d+\s*\))?/gi, "$1 TIMESTAMP");
+  s = s.replace(/(\])\s+\[datetime\]/gi, "$1 TIMESTAMP");
+  s = s.replace(/(\])\s+\[smalldatetime\]/gi, "$1 TIMESTAMP");
+  s = s.replace(/(\])\s+\[date\]/gi, "$1 DATE");
+  s = s.replace(/(\])\s+\[time\](\s*\(\s*\d+\s*\))?/gi, "$1 TIME");
 
-  // MONEY / SMALLMONEY → NUMERIC
-  s = s.replace(/\bSMALLMONEY\b/gi, "NUMERIC(10,4)");
-  s = s.replace(/\bMONEY\b/gi, "NUMERIC(19,4)");
+  // Monetary
+  s = s.replace(/(\])\s+\[smallmoney\]/gi, "$1 NUMERIC(10,4)");
+  s = s.replace(/(\])\s+\[money\]/gi, "$1 NUMERIC(19,4)");
 
-  // UNIQUEIDENTIFIER → UUID
-  s = s.replace(/\bUNIQUEIDENTIFIER\b/gi, "UUID");
+  // Numeric
+  s = s.replace(/(\])\s+\[decimal\]\s*\((\d+)\s*,\s*(\d+)\)/gi, "$1 DECIMAL($2,$3)");
+  s = s.replace(/(\])\s+\[decimal\]/gi, "$1 DECIMAL");
+  s = s.replace(/(\])\s+\[numeric\]\s*\((\d+)\s*,\s*(\d+)\)/gi, "$1 NUMERIC($2,$3)");
+  s = s.replace(/(\])\s+\[numeric\]/gi, "$1 NUMERIC");
+  s = s.replace(/(\])\s+\[bigint\]/gi, "$1 BIGINT");
+  s = s.replace(/(\])\s+\[smallint\]/gi, "$1 SMALLINT");
+  s = s.replace(/(\])\s+\[tinyint\]/gi, "$1 SMALLINT");
+  s = s.replace(/(\])\s+\[int\]/gi, "$1 INTEGER");
+  s = s.replace(/(\])\s+\[float\]/gi, "$1 DOUBLE PRECISION");
+  s = s.replace(/(\])\s+\[real\]/gi, "$1 REAL");
 
-  // IMAGE → BYTEA
-  s = s.replace(/\bIMAGE\b/gi, "BYTEA");
+  // Special types
+  s = s.replace(/(\])\s+\[uniqueidentifier\]/gi, "$1 UUID");
+  s = s.replace(/(\])\s+\[image\]/gi, "$1 BYTEA");
+  s = s.replace(/(\])\s+\[varbinary\]\s*\(\s*MAX\s*\)/gi, "$1 BYTEA");
+  s = s.replace(/(\])\s+\[varbinary\]\s*\((\d+)\)/gi, "$1 BYTEA");
+  s = s.replace(/(\])\s+\[binary\]\s*\((\d+)\)/gi, "$1 BYTEA");
+  s = s.replace(/(\])\s+\[hierarchyid\]/gi, "$1 TEXT");
+  s = s.replace(/(\])\s+\[geography\]/gi, "$1 TEXT");
+  s = s.replace(/(\])\s+\[geometry\]/gi, "$1 TEXT");
+  s = s.replace(/(\])\s+\[timestamp\]/gi, "$1 BYTEA"); // SQL Server timestamp = rowversion
 
-  // VARBINARY(MAX) → BYTEA
-  s = s.replace(/\bVARBINARY\s*\(\s*MAX\s*\)/gi, "BYTEA");
+  // ── Phase 3: Remove remaining brackets (column/table/constraint names) ──
+  s = s.replace(/\[(\w+)\]/g, "$1");
+
+  // Remove dbo. schema prefix
+  s = s.replace(/\bdbo\.\s*/gi, "");
+
+  // ── Phase 4: DDL keyword cleanup ──
 
   // GETDATE() → NOW()
   s = s.replace(/\bGETDATE\s*\(\s*\)/gi, "NOW()");
-
   // NEWID() → gen_random_uuid()
   s = s.replace(/\bNEWID\s*\(\s*\)/gi, "gen_random_uuid()");
 
-  // Remove CLUSTERED / NONCLUSTERED
-  s = s.replace(/\b(NON)?CLUSTERED\b/gi, "");
+  // Remove CLUSTERED / NONCLUSTERED keywords
+  s = s.replace(/\bNONCLUSTERED\b/gi, "");
+  s = s.replace(/\bCLUSTERED\b/gi, "");
 
-  // Remove ON [PRIMARY] / ON [filegroup]
-  s = s.replace(/\bON\s+\[?\w+\]?\s*$/gim, "");
-
-  // Remove WITH (PAD_INDEX = ..., ...) and similar
-  s = s.replace(/\bWITH\s*\([^)]*\)/gi, "");
-
-  // Remove TEXTIMAGE_ON [PRIMARY]
-  s = s.replace(/\bTEXTIMAGE_ON\s+\[?\w+\]?/gi, "");
+  // Strip ASC/DESC from column lists in PRIMARY KEY, UNIQUE, and INDEX defs
+  s = s.replace(/(\b\w+)\s+(?:ASC|DESC)\b/gi, "$1");
 
   // N'string' → 'string'
   s = s.replace(/\bN'((?:[^']|'')*?)'/g, "'$1'");
 
-  // Clean up double spaces
+  // Clean up double/triple spaces and excessive blank lines
   s = s.replace(/  +/g, " ");
+  s = s.replace(/\n\s*\n\s*\n/g, "\n\n");
 
   return s;
 }
@@ -757,11 +814,57 @@ function convertSqlServerDml(stmt: string): string {
   // N'string' → 'string'
   s = s.replace(/\bN'((?:[^']|'')*?)'/g, "'$1'");
 
+  // CAST(N'2019-06-25T06:17:28.000' AS DateTime) → '2019-06-25T06:17:28.000'::TIMESTAMP
+  // Also handles CAST(... AS DateTime2), CAST(... AS Date), etc.
+  s = s.replace(
+    /\bCAST\s*\(\s*'([^']*)'\s+AS\s+(?:DateTime2?|SmallDateTime|Date)\s*\)/gi,
+    "'$1'::TIMESTAMP"
+  );
+
   // GETDATE() → NOW()
   s = s.replace(/\bGETDATE\s*\(\s*\)/gi, "NOW()");
 
   // ISNULL(x, y) → COALESCE(x, y)
   s = s.replace(/\bISNULL\s*\(/gi, "COALESCE(");
 
+  // Ensure INSERT has INTO (SQL Server allows INSERT [table] without INTO)
+  s = s.replace(/^INSERT\s+(?!INTO\b)/i, "INSERT INTO ");
+
   return s;
+}
+
+// ---------------------------------------------------------------------------
+// Balanced-paren removal helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Find all occurrences of a pattern that ends with an opening paren,
+ * then remove everything from the pattern start through the matching
+ * closing paren (handling nested parens).
+ *
+ * Used to strip INCLUDE(...), WITH(PAD_INDEX=..., ...) etc.
+ */
+function replaceBalancedParen(sql: string, pattern: RegExp): string {
+  let result = "";
+  let lastIdx = 0;
+  let match: RegExpExecArray | null;
+
+  // Reset the regex
+  pattern.lastIndex = 0;
+
+  while ((match = pattern.exec(sql)) !== null) {
+    result += sql.slice(lastIdx, match.index);
+    // Start after the opening paren that's part of the pattern
+    let depth = 1;
+    let j = match.index + match[0].length;
+    while (j < sql.length && depth > 0) {
+      if (sql[j] === "(") depth++;
+      else if (sql[j] === ")") depth--;
+      j++;
+    }
+    lastIdx = j;
+  }
+
+  result += sql.slice(lastIdx);
+  return result;
 }
