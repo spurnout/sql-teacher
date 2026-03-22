@@ -630,8 +630,8 @@ function convertSqlServer(rawSql: string): ConversionResult {
 
   let sql = rawSql.replace(/\r\n/g, "\n");
 
-  // Remove GO batch separators
-  sql = sql.replace(/^\s*GO\s*$/gim, "");
+  // Replace GO batch separators with semicolons so splitStatements can find boundaries
+  sql = sql.replace(/^\s*GO\s*$/gim, ";");
 
   // Remove SET statements
   sql = sql.replace(
