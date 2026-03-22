@@ -690,7 +690,8 @@ function convertSqlServer(rawSql: string): ConversionResult {
   for (const stmt of stmts) {
     const kind = classifyStatement(stmt);
     if (kind === "ddl") {
-      ddlParts.push(convertSqlServerDdl(stmt, warnings) + ";");
+      const converted = convertSqlServerDdl(stmt, warnings);
+      if (converted) ddlParts.push(converted + ";");
     } else if (kind === "seed") {
       seedParts.push(convertSqlServerDml(stmt) + ";");
     } else {
@@ -718,6 +719,18 @@ function convertSqlServer(rawSql: string): ConversionResult {
 
 function convertSqlServerDdl(stmt: string, _warnings: string[]): string {
   let s = stmt;
+
+  // ── Phase 0: Skip SQL Server-specific ALTER TABLE statements ──
+  const upperTrimmed = s.toUpperCase().trimStart();
+  if (upperTrimmed.startsWith("ALTER TABLE")) {
+    // ALTER TABLE ... ADD ... DEFAULT ... FOR [col] — named default constraint (no PG equivalent)
+    if (/\bDEFAULT\b[\s\S]*\bFOR\s+\[/i.test(s)) return "";
+    // ALTER TABLE ... CHECK CONSTRAINT — enable constraint (SQL Server only)
+    if (/\b(?:NO)?CHECK\s+CONSTRAINT\b/i.test(s)) return "";
+    // ALTER TABLE ... SET — SQL Server-specific SET options
+    if (/\bSET\s*\(/i.test(s)) return "";
+    // ALTER TABLE ... ADD CONSTRAINT [PK/FK/UQ/CK] — keep these (valid in PG after conversion)
+  }
 
   // ── Phase 1: Storage directives (brackets still present) ──
   // Filegroup refs use ON [PRIMARY] (single bracketed word not followed by .[),
