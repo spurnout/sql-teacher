@@ -555,6 +555,11 @@ function convertSeedLightweight(seed: string, dialect: string): string {
         /\bCAST\s*\(\s*'([^']*)'\s+AS\s+(?:DateTime2?|SmallDateTime|Date)\s*\)/gi,
         "'$1'::TIMESTAMP"
       );
+      // CAST(value AS Decimal/Numeric(...)) → just the value
+      line = line.replace(
+        /\bCAST\s*\(\s*([.\d]+)\s+AS\s+(?:Decimal|Numeric)\s*\(\s*\d+\s*,\s*\d+\s*\)\s*\)/gi,
+        "$1"
+      );
       // Ensure INSERT INTO (SQL Server omits INTO)
       line = line.replace(/^(\s*)INSERT\s+(?!INTO\b)/i, "$1INSERT INTO ");
     }

@@ -114,8 +114,19 @@ export function detectDialect(sql: string): DetectionResult {
 /**
  * Split SQL text into individual statements, respecting string literals.
  * Returns trimmed, non-empty statements WITHOUT trailing semicolons.
+ *
+ * @param sql          The SQL text to split.
+ * @param backslashEscape  When true, treat \' as an escaped quote inside
+ *                         string literals (MySQL convention).  When false
+ *                         (default), only '' is treated as an escape — this
+ *                         is correct for PostgreSQL, SQLite, and SQL Server,
+ *                         where backslash is a literal character (e.g. file
+ *                         paths: N'C:\Data\file.mdf').
  */
-function splitStatements(sql: string): readonly string[] {
+function splitStatements(
+  sql: string,
+  backslashEscape = false,
+): readonly string[] {
   const results: string[] = [];
   let current = "";
   let inString = false;
@@ -126,13 +137,18 @@ function splitStatements(sql: string): readonly string[] {
 
     if (inString) {
       current += ch;
-      // Handle backslash-escaped quotes (\') used by MySQL and SQL Server
-      if (ch === "\\" && i + 1 < sql.length && sql[i + 1] === "'") {
+      // Handle backslash-escaped quotes (\') — MySQL only
+      if (
+        backslashEscape &&
+        ch === "\\" &&
+        i + 1 < sql.length &&
+        sql[i + 1] === "'"
+      ) {
         current += sql[i + 1];
         i += 2;
         continue;
       }
-      // Handle doubled-quote escapes ('')
+      // Handle doubled-quote escapes ('') — standard SQL, all dialects
       if (ch === "'" && i + 1 < sql.length && sql[i + 1] === "'") {
         current += sql[i + 1];
         i += 2;
@@ -197,6 +213,8 @@ type StatementKind = "ddl" | "seed" | "skip";
 
 function classifyStatement(stmt: string): StatementKind {
   const upper = stmt.toUpperCase().trimStart();
+
+  // ── DDL we want to keep ──
   if (
     upper.startsWith("CREATE TABLE") ||
     upper.startsWith("CREATE INDEX") ||
@@ -205,14 +223,24 @@ function classifyStatement(stmt: string): StatementKind {
     upper.startsWith("CREATE CLUSTERED INDEX") ||
     upper.startsWith("CREATE NONCLUSTERED INDEX") ||
     upper.startsWith("CREATE UNIQUE CLUSTERED INDEX") ||
-    upper.startsWith("CREATE UNIQUE NONCLUSTERED INDEX") ||
-    upper.startsWith("ALTER TABLE")
+    upper.startsWith("CREATE UNIQUE NONCLUSTERED INDEX")
   ) {
     return "ddl";
   }
+
+  // ALTER TABLE is DDL — but not ALTER DATABASE (SQL Server settings)
+  if (upper.startsWith("ALTER TABLE")) {
+    return "ddl";
+  }
+
+  // ── Seed data ──
   if (upper.startsWith("INSERT")) {
     return "seed";
   }
+
+  // Everything else is skipped: CREATE DATABASE, ALTER DATABASE,
+  // CREATE FUNCTION, CREATE PROCEDURE, CREATE VIEW, CREATE TRIGGER,
+  // IF blocks, EXEC, PRINT, DROP, etc.
   return "skip";
 }
 
@@ -382,7 +410,7 @@ function convertMysql(rawSql: string): ConversionResult {
   // Remove LOCK/UNLOCK TABLES
   sql = sql.replace(/^\s*(LOCK|UNLOCK)\s+TABLES\b[^;]*;\s*$/gim, "");
 
-  const stmts = splitStatements(sql);
+  const stmts = splitStatements(sql, true /* backslashEscape — MySQL uses \' */);
   const ddlParts: string[] = [];
   const seedParts: string[] = [];
 
@@ -648,8 +676,12 @@ function convertSqlServer(rawSql: string): ConversionResult {
   sql = sql.replace(/^\s*USE\s+\[?\w+\]?\s*;?\s*$/gim, "");
 
   // Remove SSMS script comment headers: /****** Object: ... Script Date: ... ******/
-  sql = sql.replace(/\/\*{5,}\s*Object:.*?\*{5,}\//g, "");
+  // These can span multiple lines, so use [\s\S] instead of . to match newlines.
+  sql = sql.replace(/\/\*{5,}[\s\S]*?\*{5,}\//g, "");
 
+  // splitStatements with backslashEscape=false — SQL Server does NOT use \'
+  // as an escape sequence.  Backslash is a literal character (e.g. file paths
+  // in CREATE DATABASE, string manipulation in functions).
   const stmts = splitStatements(sql);
   const ddlParts: string[] = [];
   const seedParts: string[] = [];
@@ -819,6 +851,12 @@ function convertSqlServerDml(stmt: string): string {
   s = s.replace(
     /\bCAST\s*\(\s*'([^']*)'\s+AS\s+(?:DateTime2?|SmallDateTime|Date)\s*\)/gi,
     "'$1'::TIMESTAMP"
+  );
+
+  // CAST(value AS Decimal/Numeric(...)) → value::NUMERIC(...)
+  s = s.replace(
+    /\bCAST\s*\(\s*([.\d]+)\s+AS\s+(?:Decimal|Numeric)\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)\s*\)/gi,
+    "$1"
   );
 
   // GETDATE() → NOW()
