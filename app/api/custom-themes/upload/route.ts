@@ -1,3 +1,8 @@
+export const runtime = "nodejs";
+
+/** Allow up to 10 minutes for large file processing */
+export const maxDuration = 600;
+
 import { NextRequest, NextResponse } from "next/server";
 import { getCurrentUser } from "@/lib/auth/session";
 import { getUserOrg, getUserOrgRole } from "@/lib/teams/queries";
@@ -126,10 +131,15 @@ export async function POST(req: NextRequest) {
   }
 
   // Read file content
+  const fileSizeMB = (file.size / 1_000_000).toFixed(1);
+  console.log(`[upload] Reading file: ${file.name} (${fileSizeMB}MB), dialect: ${dialect}`);
+  const readStart = Date.now();
+
   let rawSql: string;
   try {
     rawSql = await file.text();
   } catch {
+    console.error(`[upload] Failed to read file after ${Date.now() - readStart}ms`);
     return NextResponse.json(
       {
         error:
@@ -139,6 +149,8 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  console.log(`[upload] File read complete (${Date.now() - readStart}ms, ${rawSql.length} chars)`);
+
   if (!rawSql.trim()) {
     return NextResponse.json(
       { error: "The uploaded file is empty." },
@@ -147,12 +159,14 @@ export async function POST(req: NextRequest) {
   }
 
   // Convert SQL to PostgreSQL
+  console.log(`[upload] Starting SQL conversion (${dialect} → postgresql)...`);
+  const convertStart = Date.now();
+
   let schemaSql: string;
   let seedSql: string;
   let warnings: readonly string[];
 
   if (dialect === "postgresql") {
-    // For PostgreSQL files, extract DDL and seed directly (no dialect conversion)
     const result = convertSql(rawSql, "postgresql");
     schemaSql = result.ddl;
     seedSql = result.seed;
@@ -163,6 +177,13 @@ export async function POST(req: NextRequest) {
     seedSql = result.seed;
     warnings = result.warnings;
   }
+
+  console.log(
+    `[upload] Conversion complete (${Date.now() - convertStart}ms): ` +
+      `DDL ${(schemaSql.length / 1000).toFixed(0)}KB, ` +
+      `seed ${(seedSql.length / 1000).toFixed(0)}KB, ` +
+      `${warnings.length} warnings`
+  );
 
   if (!schemaSql.trim()) {
     const warningText =
@@ -181,6 +202,7 @@ export async function POST(req: NextRequest) {
   }
 
   // Generate schema reference from the converted DDL
+  console.log("[upload] Generating schema reference...");
   const schemaRef: SchemaReference = generateSchemaRef(schemaSql);
 
   if (schemaRef.tables.length === 0) {
@@ -194,7 +216,10 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  console.log(`[upload] Schema ref: ${schemaRef.tables.length} tables detected`);
+
   // Create theme record
+  console.log("[upload] Creating theme record...");
   const theme = await createCustomTheme({
     orgId: org.id,
     slug,
@@ -208,10 +233,17 @@ export async function POST(req: NextRequest) {
   });
 
   // Provision the database
+  console.log(`[upload] Provisioning database schema "${slug}"...`);
+  const provisionStart = Date.now();
   const result = await provisionCustomTheme(slug, schemaSql, seedSql);
+  console.log(
+    `[upload] Provisioning ${result.success ? "succeeded" : "failed"} (${Date.now() - provisionStart}ms)`
+  );
 
   if (result.success) {
     await updateCustomThemeStatus(theme.id, "provisioned");
+    const totalMs = Date.now() - readStart;
+    console.log(`[upload] Done! Total time: ${(totalMs / 1000).toFixed(1)}s`);
     return NextResponse.json({
       theme: { ...theme, status: "provisioned" as const },
       warnings: warnings.length > 0 ? warnings.slice(0, 10) : undefined,
@@ -219,6 +251,7 @@ export async function POST(req: NextRequest) {
   } else {
     await deprovisionCustomTheme(slug);
     const friendlyError = humanizeProvisionError(result.error ?? "Unknown error");
+    console.error(`[upload] Provisioning error: ${result.error}`);
     await updateCustomThemeStatus(theme.id, "error", friendlyError);
     return NextResponse.json(
       {

@@ -452,46 +452,58 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
   // Large file direct upload (server-side conversion + provisioning)
   // -----------------------------------------------------------------------
 
-  const handleLargeFileUpload = useCallback(async () => {
+  const handleLargeFileUpload = useCallback(() => {
     if (!largeFile) return;
     setError(null);
     setSuccess(null);
     setIsUploading(true);
-    setUploadProgress("Uploading file to server...");
+    setUploadProgress("Preparing upload...");
 
-    try {
-      const formData = new FormData();
-      formData.append("file", largeFile);
-      formData.append("slug", slug.toLowerCase().replace(/\s+/g, "-"));
-      formData.append("name", name);
-      formData.append("description", description);
-      formData.append("dialect", selectedDialect);
+    const formData = new FormData();
+    formData.append("file", largeFile);
+    formData.append("slug", slug.toLowerCase().replace(/\s+/g, "-"));
+    formData.append("name", name);
+    formData.append("description", description);
+    formData.append("dialect", selectedDialect);
 
+    const sizeMB = (largeFile.size / 1_000_000).toFixed(0);
+
+    // Use XMLHttpRequest for real upload progress tracking
+    const xhr = new XMLHttpRequest();
+
+    xhr.upload.addEventListener("progress", (e) => {
+      if (e.lengthComputable) {
+        const pct = Math.round((e.loaded / e.total) * 100);
+        const loadedMB = (e.loaded / 1_000_000).toFixed(0);
+        setUploadProgress(
+          `Uploading: ${loadedMB}MB / ${sizeMB}MB (${pct}%)`
+        );
+      }
+    });
+
+    xhr.upload.addEventListener("load", () => {
       setUploadProgress(
-        `Uploading ${(largeFile.size / 1_000_000).toFixed(0)}MB file... ` +
-          `Server will convert and provision automatically.`
+        "Upload complete. Server is converting and provisioning — this may take a minute..."
       );
+    });
 
-      const res = await fetch("/api/custom-themes/upload", {
-        method: "POST",
-        body: formData,
-      });
-
-      setUploadProgress("Processing server response...");
+    xhr.addEventListener("load", () => {
+      setIsUploading(false);
+      setUploadProgress(null);
 
       let data;
       try {
-        data = await res.json();
+        data = JSON.parse(xhr.responseText);
       } catch {
         setError(
-          `Server returned status ${res.status} with no details. ` +
+          `Server returned status ${xhr.status} with no parseable response. ` +
             `The file may be too large to process. Try splitting it into smaller parts.`
         );
         return;
       }
 
-      if (!res.ok) {
-        setError(data.error ?? `Server error (${res.status}). Please try again.`);
+      if (xhr.status < 200 || xhr.status >= 300) {
+        setError(data.error ?? `Server error (${xhr.status}). Please try again.`);
         return;
       }
 
@@ -506,16 +518,33 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
       );
       setIsOpen(false);
       resetForm();
-    } catch (networkErr) {
-      const detail = networkErr instanceof Error ? networkErr.message : "";
-      setError(
-        `Upload failed${detail ? `: ${detail}` : ""}. ` +
-          `Check your connection and try again. For very large files, this may take a few minutes.`
-      );
-    } finally {
+    });
+
+    xhr.addEventListener("error", () => {
       setIsUploading(false);
       setUploadProgress(null);
-    }
+      setError(
+        "Upload failed — the connection was lost. " +
+          "Check your network and try again. For very large files, this may take several minutes."
+      );
+    });
+
+    xhr.addEventListener("timeout", () => {
+      setIsUploading(false);
+      setUploadProgress(null);
+      setError(
+        "Upload timed out. The file may be too large for the current server configuration."
+      );
+    });
+
+    xhr.addEventListener("abort", () => {
+      setIsUploading(false);
+      setUploadProgress(null);
+    });
+
+    xhr.open("POST", "/api/custom-themes/upload");
+    xhr.timeout = 600_000; // 10 minute timeout for very large files
+    xhr.send(formData);
   }, [largeFile, slug, name, description, selectedDialect, resetForm]);
 
   // -----------------------------------------------------------------------
@@ -822,20 +851,25 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
                 <div className="space-y-3">
                   <div className="p-3 bg-blue-500/10 border border-blue-500/20 rounded-md">
                     <p className="text-xs text-blue-400 font-medium mb-1">
-                      Large file detected ({(largeFile.size / 1_000_000).toFixed(0)}MB)
+                      Large file ({(largeFile.size / 1_000_000).toFixed(0)}MB) — server-side processing
                     </p>
                     <p className="text-[10px] text-blue-400/80">
-                      This file is too large for browser-side preview. It will be uploaded
-                      directly to the server for conversion and provisioning.
+                      Files over 50MB are uploaded directly to the server for conversion and
+                      provisioning. No browser-side preview is available for files this large.
                     </p>
                   </div>
 
                   {uploadProgress && (
-                    <div className="flex items-center gap-2 p-3 bg-[var(--background)] border border-[var(--border)] rounded-md">
-                      <Loader2 className="w-3.5 h-3.5 animate-spin text-[var(--cta)]" />
-                      <span className="text-xs text-[var(--muted-foreground)]">
-                        {uploadProgress}
-                      </span>
+                    <div className="p-3 bg-[var(--cta)]/5 border border-[var(--cta)]/20 rounded-md space-y-2">
+                      <div className="flex items-center gap-2">
+                        <Loader2 className="w-4 h-4 animate-spin text-[var(--cta)]" />
+                        <span className="text-xs font-medium text-[var(--foreground)]">
+                          {uploadProgress}
+                        </span>
+                      </div>
+                      <p className="text-[10px] text-[var(--muted-foreground)]">
+                        Do not close this page. Large files may take several minutes to upload and process.
+                      </p>
                     </div>
                   )}
 
