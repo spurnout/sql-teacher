@@ -181,8 +181,8 @@ async function validateForeignKeys(
         child_cls.relname AS "childTable",
         parent_ns.nspname AS "parentSchema",
         parent_cls.relname AS "parentTable",
-        array_agg(child_att.attname ORDER BY cols.ord) AS "childColumns",
-        array_agg(parent_att.attname ORDER BY cols.ord) AS "parentColumns"
+        array_agg(child_att.attname::text ORDER BY cols.ord) AS "childColumns",
+        array_agg(parent_att.attname::text ORDER BY cols.ord) AS "parentColumns"
       FROM pg_constraint c
       JOIN pg_class child_cls ON child_cls.oid = c.conrelid
       JOIN pg_namespace child_ns ON child_ns.oid = child_cls.relnamespace
