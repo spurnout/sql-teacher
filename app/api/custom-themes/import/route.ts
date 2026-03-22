@@ -206,19 +206,55 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // Convert SQL to PostgreSQL
-  console.log(`[import] Converting ${dialect} → postgresql...`);
-  const convertStart = Date.now();
+  // For large files, split DDL and INSERT statements BEFORE conversion
+  // to avoid running expensive regex replacements on hundreds of MB of INSERT data.
+  // The converter processes each part separately, keeping memory usage manageable.
+  const isLarge = rawSql.length > 50_000_000; // >50MB
+  let schemaSql: string;
+  let seedSql: string;
+  let warnings: readonly string[];
 
-  const result = convertSql(rawSql, dialect as SqlDialect);
-  const { ddl: schemaSql, seed: seedSql, warnings } = result;
+  if (isLarge) {
+    console.log(`[import] Large file (${fileSizeMB}MB) — splitting DDL and seed before conversion...`);
+    const splitStart = Date.now();
+    const { ddlPart, seedPart } = splitDdlAndSeed(rawSql);
+    // Release the full raw string ASAP to free memory
+    rawSql = "";
+    console.log(
+      `[import] Split complete (${Date.now() - splitStart}ms): ` +
+        `DDL ${(ddlPart.length / 1000).toFixed(0)}KB, ` +
+        `seed ${(seedPart.length / 1_000_000).toFixed(1)}MB`
+    );
 
-  console.log(
-    `[import] Conversion complete (${Date.now() - convertStart}ms): ` +
-      `DDL ${(schemaSql.length / 1000).toFixed(0)}KB, ` +
-      `seed ${(seedSql.length / 1000).toFixed(0)}KB, ` +
-      `${warnings.length} warnings`
-  );
+    // Convert DDL through the full converter (small, safe)
+    console.log(`[import] Converting DDL (${dialect} → postgresql)...`);
+    const ddlStart = Date.now();
+    const ddlResult = convertSql(ddlPart, dialect as SqlDialect);
+    schemaSql = ddlResult.ddl;
+    warnings = ddlResult.warnings;
+    console.log(`[import] DDL conversion complete (${Date.now() - ddlStart}ms)`);
+
+    // Convert seed through the full converter (may be large but mostly INSERT statements)
+    console.log(`[import] Converting seed data (${(seedPart.length / 1_000_000).toFixed(1)}MB)...`);
+    const seedStart = Date.now();
+    const seedResult = convertSql(seedPart, dialect as SqlDialect);
+    seedSql = seedResult.seed;
+    warnings = [...warnings, ...seedResult.warnings];
+    console.log(`[import] Seed conversion complete (${Date.now() - seedStart}ms)`);
+  } else {
+    console.log(`[import] Converting ${dialect} → postgresql...`);
+    const convertStart = Date.now();
+    const result = convertSql(rawSql, dialect as SqlDialect);
+    schemaSql = result.ddl;
+    seedSql = result.seed;
+    warnings = result.warnings;
+    console.log(
+      `[import] Conversion complete (${Date.now() - convertStart}ms): ` +
+        `DDL ${(schemaSql.length / 1000).toFixed(0)}KB, ` +
+        `seed ${(seedSql.length / 1000).toFixed(0)}KB, ` +
+        `${warnings.length} warnings`
+    );
+  }
 
   if (!schemaSql.trim()) {
     const warningText = warnings.length > 0
@@ -341,6 +377,77 @@ function humanizeProvisionError(raw: string): string {
     return `Generated SQL is too large to provision.`;
   }
   return `Provisioning failed: ${raw}`;
+}
+
+// ---------------------------------------------------------------------------
+// Split DDL (CREATE/ALTER) from seed (INSERT) for memory-efficient processing
+// ---------------------------------------------------------------------------
+
+function splitDdlAndSeed(sql: string): { ddlPart: string; seedPart: string } {
+  const ddlLines: string[] = [];
+  const seedLines: string[] = [];
+
+  // Process line by line to avoid creating huge intermediate arrays.
+  // We classify each statement by its leading keyword.
+  let pos = 0;
+  let currentChunk = "";
+  let currentIsSeed = false;
+
+  while (pos < sql.length) {
+    // Find end of line
+    let eol = sql.indexOf("\n", pos);
+    if (eol === -1) eol = sql.length;
+    const line = sql.slice(pos, eol);
+    pos = eol + 1;
+
+    const trimmed = line.trimStart();
+    const upper = trimmed.slice(0, 20).toUpperCase();
+
+    // Detect statement boundaries
+    if (
+      upper.startsWith("CREATE ") ||
+      upper.startsWith("ALTER ") ||
+      upper.startsWith("SET ") ||
+      upper.startsWith("USE ") ||
+      upper.startsWith("GO") ||
+      upper.startsWith("IF ") ||
+      upper.startsWith("BEGIN") ||
+      upper.startsWith("END") ||
+      upper.startsWith("PRINT ") ||
+      upper.startsWith("EXEC") ||
+      upper.startsWith("DROP ")
+    ) {
+      // Flush previous chunk
+      if (currentChunk) {
+        if (currentIsSeed) seedLines.push(currentChunk);
+        else ddlLines.push(currentChunk);
+      }
+      currentChunk = line + "\n";
+      currentIsSeed = false;
+    } else if (upper.startsWith("INSERT ")) {
+      // Flush previous chunk
+      if (currentChunk) {
+        if (currentIsSeed) seedLines.push(currentChunk);
+        else ddlLines.push(currentChunk);
+      }
+      currentChunk = line + "\n";
+      currentIsSeed = true;
+    } else {
+      // Continuation of current statement
+      currentChunk += line + "\n";
+    }
+  }
+
+  // Flush last chunk
+  if (currentChunk) {
+    if (currentIsSeed) seedLines.push(currentChunk);
+    else ddlLines.push(currentChunk);
+  }
+
+  return {
+    ddlPart: ddlLines.join(""),
+    seedPart: seedLines.join(""),
+  };
 }
 
 // ---------------------------------------------------------------------------
