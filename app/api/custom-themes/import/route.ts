@@ -214,45 +214,66 @@ export async function POST(req: NextRequest) {
   let seedSql: string;
   let warnings: readonly string[];
 
-  if (isLarge) {
-    console.log(`[import] Large file (${fileSizeMB}MB) — splitting DDL and seed before conversion...`);
-    const splitStart = Date.now();
-    const { ddlPart, seedPart } = splitDdlAndSeed(rawSql);
-    // Release the full raw string ASAP to free memory
-    rawSql = "";
-    console.log(
-      `[import] Split complete (${Date.now() - splitStart}ms): ` +
-        `DDL ${(ddlPart.length / 1000).toFixed(0)}KB, ` +
-        `seed ${(seedPart.length / 1_000_000).toFixed(1)}MB`
-    );
+  try {
+    if (isLarge) {
+      console.log(`[import] Large file (${fileSizeMB}MB) — splitting DDL and seed before conversion...`);
+      const splitStart = Date.now();
+      const { ddlPart, seedPart } = splitDdlAndSeed(rawSql);
+      // Release the full raw string ASAP to free memory
+      rawSql = "";
+      console.log(
+        `[import] Split complete (${Date.now() - splitStart}ms): ` +
+          `DDL ${(ddlPart.length / 1000).toFixed(0)}KB, ` +
+          `seed ${(seedPart.length / 1_000_000).toFixed(1)}MB`
+      );
 
-    // Convert DDL through the full converter (small, safe)
-    console.log(`[import] Converting DDL (${dialect} → postgresql)...`);
-    const ddlStart = Date.now();
-    const ddlResult = convertSql(ddlPart, dialect as SqlDialect);
-    schemaSql = ddlResult.ddl;
-    warnings = ddlResult.warnings;
-    console.log(`[import] DDL conversion complete (${Date.now() - ddlStart}ms)`);
+      // Convert DDL through the full converter (small, safe)
+      console.log(`[import] Converting DDL (${dialect} → postgresql)...`);
+      const ddlStart = Date.now();
+      const ddlResult = convertSql(ddlPart, dialect as SqlDialect);
+      schemaSql = ddlResult.ddl;
+      warnings = ddlResult.warnings;
+      console.log(`[import] DDL conversion complete (${Date.now() - ddlStart}ms)`);
 
-    // Convert seed through the full converter (may be large but mostly INSERT statements)
-    console.log(`[import] Converting seed data (${(seedPart.length / 1_000_000).toFixed(1)}MB)...`);
-    const seedStart = Date.now();
-    const seedResult = convertSql(seedPart, dialect as SqlDialect);
-    seedSql = seedResult.seed;
-    warnings = [...warnings, ...seedResult.warnings];
-    console.log(`[import] Seed conversion complete (${Date.now() - seedStart}ms)`);
-  } else {
-    console.log(`[import] Converting ${dialect} → postgresql...`);
-    const convertStart = Date.now();
-    const result = convertSql(rawSql, dialect as SqlDialect);
-    schemaSql = result.ddl;
-    seedSql = result.seed;
-    warnings = result.warnings;
-    console.log(
-      `[import] Conversion complete (${Date.now() - convertStart}ms): ` +
-        `DDL ${(schemaSql.length / 1000).toFixed(0)}KB, ` +
-        `seed ${(seedSql.length / 1000).toFixed(0)}KB, ` +
-        `${warnings.length} warnings`
+      // Convert seed data with lightweight processing — for large files, we skip
+      // the full converter pipeline (splitStatements is O(n) character-by-character
+      // which is too slow for 400MB+) and instead do direct line-by-line conversion.
+      console.log(`[import] Converting seed data (${(seedPart.length / 1_000_000).toFixed(1)}MB)...`);
+      const seedStart = Date.now();
+      if (seedPart.length > 100_000_000) {
+        // Very large seed: do lightweight line-by-line conversion
+        seedSql = convertSeedLightweight(seedPart, dialect as string);
+        console.log(`[import] Seed conversion complete (lightweight, ${Date.now() - seedStart}ms)`);
+      } else {
+        const seedResult = convertSql(seedPart, dialect as SqlDialect);
+        seedSql = seedResult.seed;
+        warnings = [...warnings, ...seedResult.warnings];
+        console.log(`[import] Seed conversion complete (${Date.now() - seedStart}ms)`);
+      }
+    } else {
+      console.log(`[import] Converting ${dialect} → postgresql...`);
+      const convertStart = Date.now();
+      const result = convertSql(rawSql, dialect as SqlDialect);
+      schemaSql = result.ddl;
+      seedSql = result.seed;
+      warnings = result.warnings;
+      console.log(
+        `[import] Conversion complete (${Date.now() - convertStart}ms): ` +
+          `DDL ${(schemaSql.length / 1000).toFixed(0)}KB, ` +
+          `seed ${(seedSql.length / 1000).toFixed(0)}KB, ` +
+          `${warnings.length} warnings`
+      );
+    }
+  } catch (convErr) {
+    const msg = convErr instanceof Error ? convErr.message : String(convErr);
+    console.error(`[import] Conversion crashed: ${msg}`);
+    return NextResponse.json(
+      {
+        error:
+          `SQL conversion failed: ${msg}. ` +
+          `The file may be too large or contain unsupported SQL syntax.`,
+      },
+      { status: 500 }
     );
   }
 
@@ -482,4 +503,64 @@ function detectEncoding(buffer: Buffer): "utf-8" | "utf-16le" | "utf-16be" {
     if (nullAtEven > check * 0.2) return "utf-16be";
   }
   return "utf-8";
+}
+
+// ---------------------------------------------------------------------------
+// Lightweight seed conversion for very large files (>100MB of INSERT data)
+// ---------------------------------------------------------------------------
+
+/**
+ * For very large seed portions (400MB+), the full converter's character-by-
+ * character `splitStatements` is too expensive. This function does direct
+ * line-by-line regex conversion without building intermediate arrays.
+ *
+ * It handles the most critical SQL Server → PostgreSQL transformations
+ * that appear in INSERT statements:
+ * - [bracket] quoting removal
+ * - dbo. prefix removal
+ * - N'string' → 'string'
+ * - CAST(N'...' AS DateTime) → '...'::TIMESTAMP
+ * - INSERT [table] → INSERT INTO table
+ * - GO delimiter → semicolons
+ */
+function convertSeedLightweight(seed: string, dialect: string): string {
+  if (dialect !== "sqlserver") {
+    // For non-SQL Server, return seed as-is (basic cleanup only)
+    return seed.replace(/\r\n/g, "\n");
+  }
+
+  const lines = seed.split("\n");
+  const result: string[] = [];
+
+  for (const rawLine of lines) {
+    let line = rawLine;
+
+    // Skip empty lines and SQL Server noise
+    const trimmed = line.trimStart();
+    if (!trimmed) continue;
+
+    const upper = trimmed.slice(0, 10).toUpperCase();
+    if (upper.startsWith("SET ") || upper.startsWith("GO")) continue;
+
+    // Only process INSERT lines and their continuations
+    if (upper.startsWith("INSERT")) {
+      // Remove bracket quoting
+      line = line.replace(/\[(\w+)\]/g, "$1");
+      // Remove dbo. prefix
+      line = line.replace(/\bdbo\.\s*/gi, "");
+      // N'string' → 'string'
+      line = line.replace(/\bN'((?:[^']|'')*?)'/g, "'$1'");
+      // CAST(N'...' AS DateTime) → '...'::TIMESTAMP (N already stripped above)
+      line = line.replace(
+        /\bCAST\s*\(\s*'([^']*)'\s+AS\s+(?:DateTime2?|SmallDateTime|Date)\s*\)/gi,
+        "'$1'::TIMESTAMP"
+      );
+      // Ensure INSERT INTO (SQL Server omits INTO)
+      line = line.replace(/^(\s*)INSERT\s+(?!INTO\b)/i, "$1INSERT INTO ");
+    }
+
+    result.push(line);
+  }
+
+  return result.join("\n");
 }

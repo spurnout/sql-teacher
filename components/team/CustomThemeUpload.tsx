@@ -11,6 +11,8 @@ import {
   ChevronDown,
   ChevronRight,
   AlertTriangle,
+  Trash2,
+  X,
 } from "lucide-react";
 import {
   detectDialect,
@@ -66,6 +68,8 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<number | null>(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null);
 
   // Input mode
   const [inputMode, setInputMode] = useState<InputMode>("upload");
@@ -750,6 +754,29 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
     [slug, name, description, schemaSql, seedSql, schemaRefJson, inputMode, rawSql, selectedDialect, resetForm]
   );
 
+  const handleDeleteTheme = useCallback(async (themeId: number) => {
+    setDeletingId(themeId);
+    setError(null);
+    try {
+      const res = await fetch(`/api/custom-themes/${themeId}`, {
+        method: "DELETE",
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({ error: "Delete failed" }));
+        setError(data.error ?? "Failed to delete theme");
+        return;
+      }
+      setThemes((prev) => prev.filter((t) => t.id !== themeId));
+      setSuccess("Theme deleted successfully");
+      setTimeout(() => setSuccess(null), 3000);
+    } catch {
+      setError("Network error while deleting theme");
+    } finally {
+      setDeletingId(null);
+      setConfirmDeleteId(null);
+    }
+  }, []);
+
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
@@ -797,7 +824,41 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
                   custom-{theme.slug}
                 </span>
               </div>
-              <StatusBadge status={theme.status} error={theme.error_message} />
+              <div className="flex items-center gap-2">
+                <StatusBadge status={theme.status} error={theme.error_message} />
+                {confirmDeleteId === theme.id ? (
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() => handleDeleteTheme(theme.id)}
+                      disabled={deletingId === theme.id}
+                      className="px-2 py-0.5 text-xs bg-red-600 text-white rounded hover:bg-red-700 disabled:opacity-50 cursor-pointer"
+                    >
+                      {deletingId === theme.id ? (
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                      ) : (
+                        "Confirm"
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setConfirmDeleteId(null)}
+                      className="p-0.5 text-[var(--muted-foreground)] hover:text-[var(--foreground)] cursor-pointer"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setConfirmDeleteId(theme.id)}
+                    className="p-1 text-[var(--muted-foreground)] hover:text-red-500 transition-colors cursor-pointer"
+                    title="Delete theme"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
             </div>
           ))}
         </div>
