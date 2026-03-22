@@ -610,6 +610,12 @@ function convertSeedLightweight(seed: string, dialect: string): string {
         /\bCAST\s*\(\s*([.\d]+)\s+AS\s+(?:Decimal|Numeric)\s*\(\s*\d+\s*,\s*\d+\s*\)\s*\)/gi,
         "$1"
       );
+      // GETDATE() → NOW()
+      line = line.replace(/\bGETDATE\s*\(\s*\)/gi, "NOW()");
+      // ISNULL(x, y) → COALESCE(x, y)
+      line = line.replace(/\bISNULL\s*\(/gi, "COALESCE(");
+      // 0xHEX binary literals → decode('HEX','hex')
+      line = line.replace(/\b0x([0-9A-Fa-f]{2,})\b/g, "decode('$1','hex')");
       // Ensure INSERT INTO (SQL Server omits INTO)
       line = line.replace(/^(\s*)INSERT\s+(?!INTO\b)/i, "$1INSERT INTO ");
     } else if (skipCurrentBlock) {
@@ -629,6 +635,9 @@ function convertSeedLightweight(seed: string, dialect: string): string {
         /\bCAST\s*\(\s*([.\d]+)\s+AS\s+(?:Decimal|Numeric)\s*\(\s*\d+\s*,\s*\d+\s*\)\s*\)/gi,
         "$1"
       );
+      line = line.replace(/\bGETDATE\s*\(\s*\)/gi, "NOW()");
+      line = line.replace(/\bISNULL\s*\(/gi, "COALESCE(");
+      line = line.replace(/\b0x([0-9A-Fa-f]{2,})\b/g, "decode('$1','hex')");
     }
 
     result.push(line);

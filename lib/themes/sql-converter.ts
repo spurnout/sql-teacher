@@ -855,8 +855,8 @@ function convertSqlServerDdl(stmt: string, _warnings: string[]): string {
 
   // GETDATE() → NOW()
   s = s.replace(/\bGETDATE\s*\(\s*\)/gi, "NOW()");
-  // NEWID() → gen_random_uuid()
-  s = s.replace(/\bNEWID\s*\(\s*\)/gi, "gen_random_uuid()");
+  // NEWID() / NEWSEQUENTIALID() → gen_random_uuid()
+  s = s.replace(/\bNEW(?:SEQUENTIAL)?ID\s*\(\s*\)/gi, "gen_random_uuid()");
 
   // Remove CLUSTERED / NONCLUSTERED keywords
   s = s.replace(/\bNONCLUSTERED\b/gi, "");
@@ -923,6 +923,10 @@ function convertSqlServerDml(stmt: string): string {
 
   // ISNULL(x, y) → COALESCE(x, y)
   s = s.replace(/\bISNULL\s*\(/gi, "COALESCE(");
+
+  // 0xHEX binary literals → decode('HEX','hex')  (SQL Server binary/varbinary/image)
+  // Minimum 2 hex chars to avoid matching integer-context 0x0 / 0x1
+  s = s.replace(/\b0x([0-9A-Fa-f]{2,})\b/g, "decode('$1','hex')");
 
   // Ensure INSERT has INTO (SQL Server allows INSERT [table] without INTO)
   s = s.replace(/^INSERT\s+(?!INTO\b)/i, "INSERT INTO ");
