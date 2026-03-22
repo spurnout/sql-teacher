@@ -86,6 +86,7 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
   const [largeFile, setLargeFile] = useState<File | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<string | null>(null);
+  const xhrRef = useRef<XMLHttpRequest | null>(null);
 
   // CSV-specific state
   const [csvFiles, setCsvFiles] = useState<readonly CsvFile[]>([]);
@@ -116,6 +117,10 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
     setLargeFile(null);
     setIsUploading(false);
     setUploadProgress(null);
+    if (xhrRef.current) {
+      xhrRef.current.abort();
+      xhrRef.current = null;
+    }
   }, []);
 
   // -----------------------------------------------------------------------
@@ -473,10 +478,12 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
 
     xhr.upload.addEventListener("progress", (e) => {
       if (e.lengthComputable) {
-        const pct = Math.round((e.loaded / e.total) * 100);
-        const loadedMB = (e.loaded / 1_000_000).toFixed(0);
+        const pct = (e.loaded / e.total) * 100;
+        const loadedMB = (e.loaded / 1_000_000).toFixed(1);
+        // Show 1 decimal for <10%, integer for ≥10%
+        const pctStr = pct < 10 ? pct.toFixed(1) : Math.round(pct).toString();
         setUploadProgress(
-          `Uploading: ${loadedMB}MB / ${sizeMB}MB (${pct}%)`
+          `Uploading: ${loadedMB}MB / ${sizeMB}MB (${pctStr}%)`
         );
       }
     });
@@ -521,31 +528,50 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
     });
 
     xhr.addEventListener("error", () => {
+      xhrRef.current = null;
       setIsUploading(false);
       setUploadProgress(null);
       setError(
-        "Upload failed — the connection was lost. " +
-          "Check your network and try again. For very large files, this may take several minutes."
+        "Upload failed — the connection was lost or the server is not reachable. " +
+          "Make sure the server is running and try again."
       );
     });
 
     xhr.addEventListener("timeout", () => {
+      xhrRef.current = null;
       setIsUploading(false);
       setUploadProgress(null);
       setError(
-        "Upload timed out. The file may be too large for the current server configuration."
+        "Upload timed out after 10 minutes. The file may be too large for the current server configuration."
       );
     });
 
     xhr.addEventListener("abort", () => {
+      xhrRef.current = null;
       setIsUploading(false);
       setUploadProgress(null);
     });
 
+    xhr.addEventListener("loadend", () => {
+      // Always clean up ref when request finishes for any reason
+      xhrRef.current = null;
+    });
+
+    xhrRef.current = xhr;
     xhr.open("POST", "/api/custom-themes/upload");
     xhr.timeout = 600_000; // 10 minute timeout for very large files
     xhr.send(formData);
   }, [largeFile, slug, name, description, selectedDialect, resetForm]);
+
+  const handleCancelUpload = useCallback(() => {
+    if (xhrRef.current) {
+      xhrRef.current.abort();
+      xhrRef.current = null;
+    }
+    setIsUploading(false);
+    setUploadProgress(null);
+    setError(null);
+  }, []);
 
   // -----------------------------------------------------------------------
   // Submit (normal / small file flow)
@@ -861,11 +887,20 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
 
                   {uploadProgress && (
                     <div className="p-3 bg-[var(--cta)]/5 border border-[var(--cta)]/20 rounded-md space-y-2">
-                      <div className="flex items-center gap-2">
-                        <Loader2 className="w-4 h-4 animate-spin text-[var(--cta)]" />
-                        <span className="text-xs font-medium text-[var(--foreground)]">
-                          {uploadProgress}
-                        </span>
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <Loader2 className="w-4 h-4 animate-spin text-[var(--cta)]" />
+                          <span className="text-xs font-medium text-[var(--foreground)]">
+                            {uploadProgress}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={handleCancelUpload}
+                          className="px-2 py-0.5 text-[10px] text-red-400 hover:text-red-300 border border-red-400/30 rounded transition-colors cursor-pointer"
+                        >
+                          Cancel
+                        </button>
                       </div>
                       <p className="text-[10px] text-[var(--muted-foreground)]">
                         Do not close this page. Large files may take several minutes to upload and process.
