@@ -798,6 +798,7 @@ function convertSqlServerDdl(stmt: string, _warnings: string[]): string {
   s = s.replace(/(\])\s+\[text\]/gi, "$1 TEXT");
   s = s.replace(/(\])\s+\[xml\]/gi, "$1 TEXT");
   s = s.replace(/(\])\s+\[sql_variant\]/gi, "$1 TEXT");
+  s = s.replace(/(\])\s+\[sysname\]/gi, "$1 VARCHAR(128)"); // SQL Server system name type
 
   // Boolean
   s = s.replace(/(\])\s+\[bit\]/gi, "$1 BOOLEAN");
@@ -808,6 +809,7 @@ function convertSqlServerDdl(stmt: string, _warnings: string[]): string {
   s = s.replace(/(\])\s+\[smalldatetime\]/gi, "$1 TIMESTAMP");
   s = s.replace(/(\])\s+\[date\]/gi, "$1 DATE");
   s = s.replace(/(\])\s+\[time\](\s*\(\s*\d+\s*\))?/gi, "$1 TIME");
+  s = s.replace(/(\])\s+\[datetimeoffset\](\s*\(\s*\d+\s*\))?/gi, "$1 TIMESTAMP WITH TIME ZONE");
 
   // Monetary
   s = s.replace(/(\])\s+\[smallmoney\]/gi, "$1 NUMERIC(10,4)");
@@ -835,6 +837,7 @@ function convertSqlServerDdl(stmt: string, _warnings: string[]): string {
   s = s.replace(/(\])\s+\[geography\]/gi, "$1 TEXT");
   s = s.replace(/(\])\s+\[geometry\]/gi, "$1 TEXT");
   s = s.replace(/(\])\s+\[timestamp\]/gi, "$1 BYTEA"); // SQL Server timestamp = rowversion
+  s = s.replace(/(\])\s+\[rowversion\]/gi, "$1 BYTEA");
 
   // ── Phase 3: Convert remaining brackets to double-quoted identifiers ──
   // SQL Server [brackets] → PostgreSQL "double quotes" to preserve reserved-word
@@ -865,6 +868,15 @@ function convertSqlServerDdl(stmt: string, _warnings: string[]): string {
 
   // NOT FOR REPLICATION — SQL Server replication hint (invalid in PG)
   s = s.replace(/\bNOT\s+FOR\s+REPLICATION\b/gi, "");
+
+  // SPARSE — SQL Server storage hint for columns with many NULLs (no PG equivalent)
+  s = s.replace(/\bSPARSE\b/gi, "");
+
+  // ROWGUIDCOL — SQL Server marker for GUID column (no PG equivalent)
+  s = s.replace(/\bROWGUIDCOL\b/gi, "");
+
+  // COLLATE — SQL Server collation specifier (not compatible with PG collation names)
+  s = s.replace(/\bCOLLATE\s+\w+/gi, "");
 
   // N'string' → 'string'
   s = s.replace(/\bN'((?:[^']|'')*?)'/g, "'$1'");
