@@ -52,7 +52,7 @@ const BLOCKED_SQL_PATTERNS: readonly RegExp[] = [
 ];
 
 /** Max length for user-provided SQL to prevent abuse */
-const MAX_SQL_LENGTH = 100_000;
+const MAX_SQL_LENGTH = 100_000_000;
 
 export interface ProvisionResult {
   readonly success: boolean;

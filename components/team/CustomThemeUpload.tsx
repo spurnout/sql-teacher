@@ -49,7 +49,7 @@ const DIALECT_LABELS: Record<SqlDialect, string> = {
   sqlserver: "SQL Server",
 };
 
-const MAX_FILE_SIZE = 200_000; // 200KB
+const MAX_FILE_SIZE = 100_000_000; // 100MB
 
 export default function CustomThemeUpload({ existingThemes }: Props) {
   const [themes, setThemes] = useState<readonly CustomTheme[]>(existingThemes);
@@ -126,8 +126,8 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
     }
     if (file.size > MAX_FILE_SIZE) {
       setError(
-        `File too large (${(file.size / 1000).toFixed(0)}KB). ` +
-          `Maximum supported size is ${MAX_FILE_SIZE / 1000}KB. ` +
+        `File too large (${(file.size / 1_000_000).toFixed(1)}MB). ` +
+          `Maximum supported size is ${MAX_FILE_SIZE / 1_000_000}MB. ` +
           `Try removing comments or non-essential data from the dump.`
       );
       return;
@@ -217,7 +217,7 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
     const totalSize = fileArray.reduce((sum, f) => sum + f.size, 0);
     if (totalSize > MAX_FILE_SIZE * 2) {
       setError(
-        `Total file size (${(totalSize / 1000).toFixed(0)}KB) exceeds the ${(MAX_FILE_SIZE * 2) / 1000}KB limit. ` +
+        `Total file size (${(totalSize / 1_000_000).toFixed(1)}MB) exceeds the ${(MAX_FILE_SIZE * 2) / 1_000_000}MB limit. ` +
           `Try reducing the number of rows or splitting into smaller files.`
       );
       return;
@@ -672,7 +672,7 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
                       Drop .sql file here or click to browse
                     </p>
                     <p className="text-[10px] text-[var(--muted-foreground)] mt-1">
-                      Supports PostgreSQL, MySQL, SQLite, SQL Server dumps (max 200KB)
+                      Supports PostgreSQL, MySQL, SQLite, SQL Server dumps (max 100MB)
                     </p>
                   </div>
                 )}
