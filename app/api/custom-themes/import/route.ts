@@ -152,13 +152,35 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // Read the file from disk
+  // Read the file from disk, handling UTF-16 encoding (common in SSMS exports)
   console.log(`[import] Reading file from disk: ${safeName}`);
   const readStart = Date.now();
 
   let rawSql: string;
   try {
-    rawSql = await readFile(filePath, "utf-8");
+    // First read raw bytes to detect encoding via BOM
+    const rawBuffer = await readFile(filePath);
+    const encoding = detectEncoding(rawBuffer);
+    console.log(`[import] Detected encoding: ${encoding}`);
+
+    if (encoding === "utf-16le") {
+      rawSql = rawBuffer.toString("utf16le");
+      // Strip UTF-16 LE BOM if present
+      if (rawSql.charCodeAt(0) === 0xfeff) rawSql = rawSql.slice(1);
+    } else if (encoding === "utf-16be") {
+      // Node doesn't natively support utf-16be — swap bytes to LE
+      for (let i = 0; i < rawBuffer.length - 1; i += 2) {
+        const tmp = rawBuffer[i];
+        rawBuffer[i] = rawBuffer[i + 1];
+        rawBuffer[i + 1] = tmp;
+      }
+      rawSql = rawBuffer.toString("utf16le");
+      if (rawSql.charCodeAt(0) === 0xfeff) rawSql = rawSql.slice(1);
+    } else {
+      rawSql = rawBuffer.toString("utf-8");
+      // Strip UTF-8 BOM if present
+      if (rawSql.charCodeAt(0) === 0xfeff) rawSql = rawSql.slice(1);
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : "";
     if (msg.includes("ENOENT")) {
@@ -319,4 +341,38 @@ function humanizeProvisionError(raw: string): string {
     return `Generated SQL is too large to provision.`;
   }
   return `Provisioning failed: ${raw}`;
+}
+
+// ---------------------------------------------------------------------------
+// Encoding detection — handles UTF-16 exports from SSMS and other tools
+// ---------------------------------------------------------------------------
+
+function detectEncoding(buffer: Buffer): "utf-8" | "utf-16le" | "utf-16be" {
+  if (buffer.length >= 2) {
+    // UTF-16 LE BOM: FF FE
+    if (buffer[0] === 0xff && buffer[1] === 0xfe) return "utf-16le";
+    // UTF-16 BE BOM: FE FF
+    if (buffer[0] === 0xfe && buffer[1] === 0xff) return "utf-16be";
+  }
+  // UTF-8 BOM: EF BB BF (still return utf-8)
+  if (buffer.length >= 3 && buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf) {
+    return "utf-8";
+  }
+  // No BOM — check for NUL bytes in first 100 bytes (heuristic for UTF-16 without BOM)
+  if (buffer.length >= 20) {
+    let nullAtOdd = 0;
+    let nullAtEven = 0;
+    const check = Math.min(buffer.length, 100);
+    for (let i = 0; i < check; i++) {
+      if (buffer[i] === 0) {
+        if (i % 2 === 0) nullAtEven++;
+        else nullAtOdd++;
+      }
+    }
+    // UTF-16 LE: NUL bytes at odd positions (ASCII char + 0x00)
+    if (nullAtOdd > check * 0.2) return "utf-16le";
+    // UTF-16 BE: NUL bytes at even positions (0x00 + ASCII char)
+    if (nullAtEven > check * 0.2) return "utf-16be";
+  }
+  return "utf-8";
 }
