@@ -446,9 +446,12 @@ function splitDdlAndSeed(
       }
     }
 
+    // Re-insert GO between chunks so that convertSqlServer's re-scan
+    // properly resets inRoutineBatch.  Without GO, a CREATE VIEW chunk
+    // would swallow all subsequent CREATE TABLE chunks.
     return {
-      ddlPart: ddlChunks.join("\n\n"),
-      seedPart: seedChunks.join("\n\n"),
+      ddlPart: ddlChunks.join("\nGO\n"),
+      seedPart: seedChunks.join("\nGO\n"),
     };
   }
 
