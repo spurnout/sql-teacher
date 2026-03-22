@@ -154,8 +154,8 @@ export async function provisionCustomTheme(
   try {
     await client.query("BEGIN");
 
-    // Set a statement timeout to prevent long-running DDL
-    await client.query("SET LOCAL statement_timeout = '30s'");
+    // Set a statement timeout — large imports (200MB+) can take minutes
+    await client.query("SET LOCAL statement_timeout = '600s'");
 
     // Create the schema using identifier quoting for defense-in-depth
     await client.query(
@@ -166,8 +166,20 @@ export async function provisionCustomTheme(
     await client.query(`SET LOCAL search_path = '"${schemaName}"', public`);
     await client.query(schemaSql);
 
+    // Disable FK checks during seed import — SSMS exports don't guarantee
+    // INSERT order matches foreign key dependencies.  replica role tells
+    // PostgreSQL to skip all FK / CHECK / NOT NULL trigger enforcement.
+    await client.query(
+      "SET LOCAL session_replication_role = 'replica'"
+    );
+
     // Execute seed data
     await client.query(seedSql);
+
+    // Re-enable FK checks so subsequent queries are validated normally
+    await client.query(
+      "SET LOCAL session_replication_role = 'origin'"
+    );
 
     // Grant sandbox_user read access
     await client.query(`SET LOCAL search_path = 'public'`);
