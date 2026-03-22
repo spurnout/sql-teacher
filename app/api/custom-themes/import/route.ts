@@ -341,15 +341,26 @@ export async function POST(req: NextRequest) {
     const friendlyError = humanizeProvisionError(provisionResult.error ?? "Unknown error");
     console.error(`[import] Provisioning error: ${provisionResult.error}`);
 
-    // Log DDL context around the error position for debugging
+    // Log context around the error position for debugging.
+    // We don't know whether the error is from schemaSql or seedSql (they run
+    // as separate queries), so show both if the position is ambiguous.
     const posMatch = provisionResult.error?.match(/position:\s*(\d+)/i);
     if (posMatch) {
       const pos = parseInt(posMatch[1], 10);
-      const errSource = pos < schemaSql.length ? schemaSql : seedSql;
-      const effectivePos = pos < schemaSql.length ? pos : pos; // position is within whichever SQL chunk PG was executing
-      const start = Math.max(0, effectivePos - 200);
-      const end = Math.min(errSource.length, effectivePos + 200);
-      console.error(`[import] DDL around error position ${pos}:\n...${errSource.slice(start, end)}...`);
+      // Show DDL context
+      if (pos < schemaSql.length) {
+        const start = Math.max(0, pos - 200);
+        const end = Math.min(schemaSql.length, pos + 200);
+        console.error(`[import] DDL around position ${pos}:\n...${schemaSql.slice(start, end)}...`);
+      }
+      // Always show seed context too — the error position is relative to whichever query failed
+      if (pos < seedSql.length) {
+        const start = Math.max(0, pos - 200);
+        const end = Math.min(seedSql.length, pos + 200);
+        console.error(`[import] Seed around position ${pos}:\n...${seedSql.slice(start, end)}...`);
+      }
+      // Also show the very start of seed data for garbage detection
+      console.error(`[import] Seed first 300 chars:\n${seedSql.slice(0, 300)}`);
     }
     await updateCustomThemeStatus(theme.id, "error", friendlyError);
     return NextResponse.json(
@@ -555,6 +566,15 @@ function convertSeedLightweight(seed: string, dialect: string): string {
 
     // Only process INSERT lines and their continuations
     if (upper.startsWith("INSERT")) {
+      // Terminate the previous statement before starting a new INSERT.
+      // In SSMS exports, GO delimits statements, but we stripped those —
+      // PostgreSQL needs semicolons between statements.
+      if (result.length > 0) {
+        const lastIdx = result.length - 1;
+        const last = result[lastIdx].trimEnd();
+        if (!last.endsWith(";")) result[lastIdx] = last + ";";
+      }
+
       // Remove [dbo]. prefix BEFORE bracket-to-quote conversion
       line = line.replace(/\[dbo\]\.\s*/gi, "");
       // Convert [bracket] quoting to "double-quoted" identifiers (preserves reserved words)
@@ -576,6 +596,13 @@ function convertSeedLightweight(seed: string, dialect: string): string {
     }
 
     result.push(line);
+  }
+
+  // Terminate the final statement
+  if (result.length > 0) {
+    const lastIdx = result.length - 1;
+    const last = result[lastIdx].trimEnd();
+    if (!last.endsWith(";")) result[lastIdx] = last + ";";
   }
 
   return result.join("\n");
