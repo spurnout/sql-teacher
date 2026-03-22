@@ -11,7 +11,7 @@ const VALID_DIALECTS: ReadonlySet<string> = new Set([
   "sqlserver",
 ]);
 
-const MAX_RAW_SQL_LENGTH = 100_000_000;
+const MAX_RAW_SQL_LENGTH = 1_000_000_000;
 
 /** POST /api/custom-themes/convert — server-side SQL conversion */
 export async function POST(req: NextRequest) {

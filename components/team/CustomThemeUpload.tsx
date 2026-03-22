@@ -49,7 +49,7 @@ const DIALECT_LABELS: Record<SqlDialect, string> = {
   sqlserver: "SQL Server",
 };
 
-const MAX_FILE_SIZE = 100_000_000; // 100MB
+const MAX_FILE_SIZE = 1_000_000_000; // 1GB
 
 export default function CustomThemeUpload({ existingThemes }: Props) {
   const [themes, setThemes] = useState<readonly CustomTheme[]>(existingThemes);
@@ -672,7 +672,7 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
                       Drop .sql file here or click to browse
                     </p>
                     <p className="text-[10px] text-[var(--muted-foreground)] mt-1">
-                      Supports PostgreSQL, MySQL, SQLite, SQL Server dumps (max 100MB)
+                      Supports PostgreSQL, MySQL, SQLite, SQL Server dumps (max 1GB)
                     </p>
                   </div>
                 )}
