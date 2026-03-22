@@ -737,6 +737,17 @@ function convertSqlServerDdl(stmt: string, _warnings: string[]): string {
   // Remove WITH (PAD_INDEX = ..., ...) storage option clauses
   s = replaceBalancedParen(s, /\bWITH\s*\(/gi);
 
+  // Remove named DEFAULT constraints — PostgreSQL doesn't support CONSTRAINT name
+  // on DEFAULT clauses.  CONSTRAINT [DF_Table_Col] DEFAULT ((0)) → DEFAULT ((0))
+  s = s.replace(/CONSTRAINT\s+\[[^\]]+\]\s+DEFAULT\b/gi, "DEFAULT");
+
+  // Remove named NOT NULL constraints — e.g. CONSTRAINT [NN_Col] NOT NULL → NOT NULL
+  s = s.replace(/CONSTRAINT\s+\[[^\]]+\]\s+NOT\s+NULL\b/gi, "NOT NULL");
+
+  // Simplify double-parenthesized DEFAULT values: DEFAULT ((0)) → DEFAULT (0)
+  // SQL Server wraps simple defaults in extra parens.
+  s = s.replace(/\bDEFAULT\s+\(\(([^()]*)\)\)/gi, "DEFAULT ($1)");
+
   // ── Phase 2: Type conversions using positional matching ──
   // In SQL Server DDL, column defs follow the pattern: [col_name] [type_name].
   // By matching `] [type]` (type after column name's closing bracket), we avoid
