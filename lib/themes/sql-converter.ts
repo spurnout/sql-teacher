@@ -720,16 +720,24 @@ function convertSqlServer(rawSql: string): ConversionResult {
 function convertSqlServerDdl(stmt: string, _warnings: string[]): string {
   let s = stmt;
 
-  // ── Phase 0: Skip SQL Server-specific ALTER TABLE statements ──
+  // ── Phase 0: Skip or fix SQL Server-specific ALTER TABLE statements ──
   const upperTrimmed = s.toUpperCase().trimStart();
   if (upperTrimmed.startsWith("ALTER TABLE")) {
-    // ALTER TABLE ... ADD ... DEFAULT ... FOR [col] — named default constraint (no PG equivalent)
-    if (/\bDEFAULT\b[\s\S]*\bFOR\s+\[/i.test(s)) return "";
+    // ALTER TABLE ... DEFAULT ... FOR col/[col] — named default constraint (no PG equivalent)
+    // Handles both bracketed and unbracketed column names after FOR
+    if (/\bDEFAULT\b[\s\S]*\bFOR\s+(\[|\w)/i.test(s)) return "";
     // ALTER TABLE ... CHECK CONSTRAINT — enable constraint (SQL Server only)
     if (/\b(?:NO)?CHECK\s+CONSTRAINT\b/i.test(s)) return "";
     // ALTER TABLE ... SET — SQL Server-specific SET options
     if (/\bSET\s*\(/i.test(s)) return "";
-    // ALTER TABLE ... ADD CONSTRAINT [PK/FK/UQ/CK] — keep these (valid in PG after conversion)
+    // ALTER TABLE ... ENABLE/DISABLE TRIGGER — SQL Server only
+    if (/\b(?:ENABLE|DISABLE)\s+TRIGGER\b/i.test(s)) return "";
+    // ALTER TABLE ... SWITCH — partition switching (SQL Server only)
+    if (/\bSWITCH\b/i.test(s)) return "";
+
+    // Strip WITH CHECK / WITH NOCHECK prefix from ADD CONSTRAINT (SQL Server only)
+    // but keep the FK/PK constraint itself — it's valid PG after conversion
+    s = s.replace(/\bWITH\s+(?:NO)?CHECK\s+/gi, "");
   }
 
   // ── Phase 1: Storage directives (brackets still present) ──
@@ -855,8 +863,14 @@ function convertSqlServerDdl(stmt: string, _warnings: string[]): string {
   // Handles both double-quoted identifiers ("Col" ASC) and bare identifiers (Col ASC)
   s = s.replace(/("[^"]+?"|\w+)\s+(?:ASC|DESC)\b/gi, "$1");
 
+  // NOT FOR REPLICATION — SQL Server replication hint (invalid in PG)
+  s = s.replace(/\bNOT\s+FOR\s+REPLICATION\b/gi, "");
+
   // N'string' → 'string'
   s = s.replace(/\bN'((?:[^']|'')*?)'/g, "'$1'");
+
+  // CONVERT(type, value[, style]) → value (best-effort SQL Server function removal)
+  s = s.replace(/\bCONVERT\s*\([^,)]+,\s*([^,)]+)(?:,[^)]+)?\)/gi, "$1");
 
   // Clean up double/triple spaces and excessive blank lines
   s = s.replace(/  +/g, " ");

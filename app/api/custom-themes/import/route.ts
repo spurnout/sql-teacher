@@ -340,6 +340,17 @@ export async function POST(req: NextRequest) {
     await deprovisionCustomTheme(slug);
     const friendlyError = humanizeProvisionError(provisionResult.error ?? "Unknown error");
     console.error(`[import] Provisioning error: ${provisionResult.error}`);
+
+    // Log DDL context around the error position for debugging
+    const posMatch = provisionResult.error?.match(/position:\s*(\d+)/i);
+    if (posMatch) {
+      const pos = parseInt(posMatch[1], 10);
+      const errSource = pos < schemaSql.length ? schemaSql : seedSql;
+      const effectivePos = pos < schemaSql.length ? pos : pos; // position is within whichever SQL chunk PG was executing
+      const start = Math.max(0, effectivePos - 200);
+      const end = Math.min(errSource.length, effectivePos + 200);
+      console.error(`[import] DDL around error position ${pos}:\n...${errSource.slice(start, end)}...`);
+    }
     await updateCustomThemeStatus(theme.id, "error", friendlyError);
     return NextResponse.json(
       {
