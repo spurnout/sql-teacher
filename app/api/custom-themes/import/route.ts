@@ -468,13 +468,20 @@ function splitDdlAndSeed(sql: string): { ddlPart: string; seedPart: string } {
       currentChunk = line + "\n";
       currentIsSeed = false;
     } else if (upper.startsWith("INSERT ")) {
-      // Flush previous chunk
-      if (currentChunk) {
-        if (currentIsSeed) seedLines.push(currentChunk);
-        else ddlLines.push(currentChunk);
+      // Skip INSERT statements targeting @table_variables or #temp_tables —
+      // these come from stored procedure bodies, not real data.
+      if (/\bINSERT\s+(?:INTO\s+)?[@#]/i.test(trimmed)) {
+        currentChunk += line + "\n";
+        // Keep currentIsSeed unchanged — this is part of a proc body (DDL context)
+      } else {
+        // Flush previous chunk
+        if (currentChunk) {
+          if (currentIsSeed) seedLines.push(currentChunk);
+          else ddlLines.push(currentChunk);
+        }
+        currentChunk = line + "\n";
+        currentIsSeed = true;
       }
-      currentChunk = line + "\n";
-      currentIsSeed = true;
     } else {
       // Continuation of current statement
       currentChunk += line + "\n";
@@ -570,9 +577,9 @@ function convertSeedLightweight(seed: string, dialect: string): string {
     // Only process INSERT lines and their continuations
     if (upper.startsWith("INSERT")) {
       // Skip INSERT statements from stored procedure bodies that leaked into
-      // seed data. These target @table_variables or use INSERT...SELECT rather
-      // than INSERT...VALUES.  They are T-SQL, not data.
-      if (/\bINSERT\s+(?:INTO\s+)?@/i.test(trimmed)) {
+      // seed data. These target @table_variables or #temp_tables — they are
+      // T-SQL procedural code, not real data.
+      if (/\bINSERT\s+(?:INTO\s+)?[@#]/i.test(trimmed)) {
         skipCurrentBlock = true;
         continue;
       }
@@ -591,8 +598,8 @@ function convertSeedLightweight(seed: string, dialect: string): string {
       line = line.replace(/\[dbo\]\.\s*/gi, "");
       // Convert [bracket] quoting to "double-quoted" identifiers (preserves reserved words)
       line = line.replace(/\[([^\]]+)\]/g, '"$1"');
-      // N'string' → 'string'
-      line = line.replace(/\bN'((?:[^']|'')*?)'/g, "'$1'");
+      // N'string' → 'string'  (greedy — lazy *? breaks on escaped '' like N'can''t')
+      line = line.replace(/\bN'((?:[^']|'')*)'/g, "'$1'");
       // CAST(N'...' AS DateTime) → '...'::TIMESTAMP (N already stripped above)
       line = line.replace(
         /\bCAST\s*\(\s*'([^']*)'\s+AS\s+(?:DateTime2?|SmallDateTime|Date)\s*\)/gi,
@@ -608,6 +615,20 @@ function convertSeedLightweight(seed: string, dialect: string): string {
     } else if (skipCurrentBlock) {
       // Skip continuation lines of a stored-proc INSERT that we're filtering out
       continue;
+    } else {
+      // Continuation line (e.g. VALUES rows in multi-line INSERT statements).
+      // Apply the same SQL Server→PG data transformations as the INSERT header.
+      line = line.replace(/\[dbo\]\.\s*/gi, "");
+      line = line.replace(/\[([^\]]+)\]/g, '"$1"');
+      line = line.replace(/\bN'((?:[^']|'')*)'/g, "'$1'");
+      line = line.replace(
+        /\bCAST\s*\(\s*'([^']*)'\s+AS\s+(?:DateTime2?|SmallDateTime|Date)\s*\)/gi,
+        "'$1'::TIMESTAMP"
+      );
+      line = line.replace(
+        /\bCAST\s*\(\s*([.\d]+)\s+AS\s+(?:Decimal|Numeric)\s*\(\s*\d+\s*,\s*\d+\s*\)\s*\)/gi,
+        "$1"
+      );
     }
 
     result.push(line);

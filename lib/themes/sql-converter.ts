@@ -878,8 +878,8 @@ function convertSqlServerDdl(stmt: string, _warnings: string[]): string {
   // COLLATE — SQL Server collation specifier (not compatible with PG collation names)
   s = s.replace(/\bCOLLATE\s+\w+/gi, "");
 
-  // N'string' → 'string'
-  s = s.replace(/\bN'((?:[^']|'')*?)'/g, "'$1'");
+  // N'string' → 'string'  (greedy — lazy *? would break on escaped '' like N'can''t')
+  s = s.replace(/\bN'((?:[^']|'')*)'/g, "'$1'");
 
   // CONVERT(type, value[, style]) → value (best-effort SQL Server function removal)
   s = s.replace(/\bCONVERT\s*\([^,)]+,\s*([^,)]+)(?:,[^)]+)?\)/gi, "$1");
@@ -902,8 +902,8 @@ function convertSqlServerDml(stmt: string): string {
   // Remove any leftover bare dbo. prefix
   s = s.replace(/\bdbo\.\s*/gi, "");
 
-  // N'string' → 'string'
-  s = s.replace(/\bN'((?:[^']|'')*?)'/g, "'$1'");
+  // N'string' → 'string'  (greedy — lazy *? would break on escaped '' like N'can''t')
+  s = s.replace(/\bN'((?:[^']|'')*)'/g, "'$1'");
 
   // CAST(N'2019-06-25T06:17:28.000' AS DateTime) → '2019-06-25T06:17:28.000'::TIMESTAMP
   // Also handles CAST(... AS DateTime2), CAST(... AS Date), etc.
