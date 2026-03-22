@@ -25,6 +25,8 @@ services:
     restart: unless-stopped
     ports:
       - "3002:3002"
+    volumes:
+      - ./imports:/app/imports
     environment:
       DATABASE_URL: postgres://sandbox_user:sandbox_password@postgres:5432/sql_teacher
       DATABASE_ADMIN_URL: postgres://admin:admin_password@postgres:5432/sql_teacher

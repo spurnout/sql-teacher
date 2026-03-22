@@ -1,0 +1,322 @@
+export const runtime = "nodejs";
+export const maxDuration = 600;
+
+import { NextRequest, NextResponse } from "next/server";
+import { readdir, readFile, stat } from "fs/promises";
+import path from "path";
+import { getCurrentUser } from "@/lib/auth/session";
+import { getUserOrg, getUserOrgRole } from "@/lib/teams/queries";
+import {
+  createCustomTheme,
+  updateCustomThemeStatus,
+  isSlugAvailable,
+} from "@/lib/themes/queries";
+import {
+  provisionCustomTheme,
+  deprovisionCustomTheme,
+} from "@/lib/themes/provisioner";
+import { convertSql, type SqlDialect } from "@/lib/themes/sql-converter";
+import { generateSchemaRef } from "@/lib/themes/schema-parser";
+import type { SchemaReference } from "@/content/schema/reference";
+
+const VALID_SQL_DIALECTS: ReadonlySet<string> = new Set([
+  "postgresql",
+  "mysql",
+  "sqlite",
+  "sqlserver",
+]);
+
+const SLUG_REGEX = /^[a-z0-9][a-z0-9_-]{1,48}[a-z0-9]$/;
+
+/** Directory where import files are mounted */
+const IMPORTS_DIR = path.resolve(process.cwd(), "imports");
+
+/**
+ * GET /api/custom-themes/import — list available .sql files in the imports directory
+ */
+export async function GET() {
+  const user = await getCurrentUser();
+  if (!user) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  try {
+    const entries = await readdir(IMPORTS_DIR).catch(() => [] as string[]);
+    const sqlFiles: Array<{ name: string; sizeMB: string }> = [];
+
+    for (const entry of entries) {
+      if (!/\.(sql|csv|tsv|txt)$/i.test(entry)) continue;
+      try {
+        const fileStat = await stat(path.join(IMPORTS_DIR, entry));
+        if (fileStat.isFile()) {
+          sqlFiles.push({
+            name: entry,
+            sizeMB: (fileStat.size / 1_000_000).toFixed(1),
+          });
+        }
+      } catch {
+        // Skip files we can't stat
+      }
+    }
+
+    return NextResponse.json({ files: sqlFiles });
+  } catch {
+    return NextResponse.json({ files: [] });
+  }
+}
+
+/**
+ * POST /api/custom-themes/import — import a .sql file from the imports directory
+ *
+ * Reads the file from the server filesystem (mounted Docker volume),
+ * converts it, generates schema ref, and provisions — all server-side.
+ * No HTTP body size limits since the file is read from disk.
+ */
+export async function POST(req: NextRequest) {
+  const user = await getCurrentUser();
+  if (!user) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const org = await getUserOrg(user.id);
+  if (!org) {
+    return NextResponse.json(
+      { error: "You must be part of an organization" },
+      { status: 403 }
+    );
+  }
+
+  const role = await getUserOrgRole(user.id, org.id);
+  if (role !== "owner" && role !== "manager") {
+    return NextResponse.json(
+      { error: "Only owners and managers can create custom themes" },
+      { status: 403 }
+    );
+  }
+
+  let body: Record<string, unknown>;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+  }
+
+  const { fileName, slug, name, description, dialect } = body;
+
+  // Validate inputs
+  if (typeof fileName !== "string" || !fileName.trim()) {
+    return NextResponse.json(
+      { error: "fileName is required" },
+      { status: 400 }
+    );
+  }
+
+  if (typeof slug !== "string" || !SLUG_REGEX.test(slug)) {
+    return NextResponse.json(
+      { error: "Invalid slug. Use lowercase letters, numbers, and hyphens (3-50 chars)." },
+      { status: 400 }
+    );
+  }
+
+  if (typeof name !== "string" || name.trim().length === 0 || name.length > 200) {
+    return NextResponse.json(
+      { error: "Name is required (max 200 chars)" },
+      { status: 400 }
+    );
+  }
+
+  if (typeof dialect !== "string" || !VALID_SQL_DIALECTS.has(dialect)) {
+    return NextResponse.json(
+      { error: `Invalid dialect. Supported: ${[...VALID_SQL_DIALECTS].join(", ")}` },
+      { status: 400 }
+    );
+  }
+
+  // Security: prevent directory traversal
+  const safeName = path.basename(fileName);
+  if (safeName !== fileName || fileName.includes("..")) {
+    return NextResponse.json(
+      { error: "Invalid file name" },
+      { status: 400 }
+    );
+  }
+
+  const filePath = path.join(IMPORTS_DIR, safeName);
+
+  // Check slug availability
+  const available = await isSlugAvailable(slug);
+  if (!available) {
+    return NextResponse.json(
+      { error: "This slug is already in use" },
+      { status: 409 }
+    );
+  }
+
+  // Read the file from disk
+  console.log(`[import] Reading file from disk: ${safeName}`);
+  const readStart = Date.now();
+
+  let rawSql: string;
+  try {
+    rawSql = await readFile(filePath, "utf-8");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "";
+    if (msg.includes("ENOENT")) {
+      return NextResponse.json(
+        { error: `File "${safeName}" not found in the imports directory. Make sure it exists in the imports/ folder.` },
+        { status: 404 }
+      );
+    }
+    console.error(`[import] Failed to read file: ${msg}`);
+    return NextResponse.json(
+      { error: `Could not read file: ${msg}` },
+      { status: 500 }
+    );
+  }
+
+  const fileSizeMB = (rawSql.length / 1_000_000).toFixed(1);
+  console.log(`[import] File read complete (${Date.now() - readStart}ms, ${fileSizeMB}MB, ${rawSql.length} chars)`);
+
+  if (!rawSql.trim()) {
+    return NextResponse.json(
+      { error: "The file is empty." },
+      { status: 400 }
+    );
+  }
+
+  // Convert SQL to PostgreSQL
+  console.log(`[import] Converting ${dialect} → postgresql...`);
+  const convertStart = Date.now();
+
+  const result = convertSql(rawSql, dialect as SqlDialect);
+  const { ddl: schemaSql, seed: seedSql, warnings } = result;
+
+  console.log(
+    `[import] Conversion complete (${Date.now() - convertStart}ms): ` +
+      `DDL ${(schemaSql.length / 1000).toFixed(0)}KB, ` +
+      `seed ${(seedSql.length / 1000).toFixed(0)}KB, ` +
+      `${warnings.length} warnings`
+  );
+
+  if (!schemaSql.trim()) {
+    const warningText = warnings.length > 0
+      ? ` Converter notes: ${warnings.slice(0, 3).join("; ")}`
+      : "";
+    return NextResponse.json(
+      {
+        error:
+          `No CREATE TABLE statements found after converting from ${dialect}. ` +
+          `Make sure the file contains table definitions (schema), not just data.${warningText}`,
+      },
+      { status: 422 }
+    );
+  }
+
+  // Generate schema reference
+  console.log("[import] Generating schema reference...");
+  const schemaRef: SchemaReference = generateSchemaRef(schemaSql);
+
+  if (schemaRef.tables.length === 0) {
+    return NextResponse.json(
+      {
+        error: "Could not parse any table definitions from the converted SQL.",
+      },
+      { status: 422 }
+    );
+  }
+
+  console.log(`[import] Schema ref: ${schemaRef.tables.length} tables`);
+
+  // Create theme record
+  console.log("[import] Creating theme record...");
+  const theme = await createCustomTheme({
+    orgId: org.id,
+    slug,
+    name: name.trim(),
+    description: typeof description === "string" ? description.trim() : "",
+    schemaSql,
+    seedSql,
+    schemaRef,
+    tableMapping: null,
+    sourceDialect: dialect,
+  });
+
+  // Provision the database
+  console.log(`[import] Provisioning database "${slug}"...`);
+  const provisionStart = Date.now();
+  const provisionResult = await provisionCustomTheme(slug, schemaSql, seedSql);
+  console.log(
+    `[import] Provisioning ${provisionResult.success ? "succeeded" : "failed"} (${Date.now() - provisionStart}ms)`
+  );
+
+  if (provisionResult.success) {
+    await updateCustomThemeStatus(theme.id, "provisioned");
+    const totalMs = Date.now() - readStart;
+    console.log(`[import] Done! Total time: ${(totalMs / 1000).toFixed(1)}s`);
+    return NextResponse.json({
+      theme: { ...theme, status: "provisioned" as const },
+      warnings: warnings.length > 0 ? warnings.slice(0, 10) : undefined,
+    });
+  } else {
+    await deprovisionCustomTheme(slug);
+    const friendlyError = humanizeProvisionError(provisionResult.error ?? "Unknown error");
+    console.error(`[import] Provisioning error: ${provisionResult.error}`);
+    await updateCustomThemeStatus(theme.id, "error", friendlyError);
+    return NextResponse.json(
+      {
+        error: friendlyError,
+        theme: {
+          ...theme,
+          status: "error" as const,
+          error_message: friendlyError,
+        },
+      },
+      { status: 422 }
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// humanizeProvisionError
+// ---------------------------------------------------------------------------
+
+function humanizeProvisionError(raw: string): string {
+  if (/syntax error/i.test(raw)) {
+    const near = raw.match(/at or near "([^"]+)"/)?.[1];
+    return near
+      ? `SQL syntax error near "${near}". The dialect converter may have produced invalid PostgreSQL.`
+      : `SQL syntax error in the generated DDL.`;
+  }
+  if (/relation .+ already exists/i.test(raw)) {
+    const table = raw.match(/relation "([^"]+)"/)?.[1];
+    return `Table "${table ?? "unknown"}" already exists. Try a different slug.`;
+  }
+  if (/type .+ does not exist/i.test(raw)) {
+    const type = raw.match(/type "([^"]+)"/)?.[1];
+    return `Unknown column type "${type ?? "unknown"}". The converter missed a type mapping.`;
+  }
+  if (/column .+ does not exist/i.test(raw)) {
+    const col = raw.match(/column "([^"]+)"/)?.[1];
+    return `Column "${col ?? "unknown"}" in INSERT doesn't match the table schema.`;
+  }
+  if (/duplicate key value violates unique constraint/i.test(raw)) {
+    return `Duplicate primary key in seed data.`;
+  }
+  if (/violates foreign key constraint/i.test(raw)) {
+    return `Foreign key violation — parent table data may be missing or INSERTs are in wrong order.`;
+  }
+  if (/violates not-null constraint/i.test(raw)) {
+    const col = raw.match(/column "([^"]+)"/)?.[1];
+    return `Required column "${col ?? "unknown"}" has NULL values in seed data.`;
+  }
+  if (/disallowed SQL statement/i.test(raw)) {
+    return `SQL contains disallowed statements. Only CREATE TABLE, CREATE INDEX, ALTER TABLE, and INSERT are permitted.`;
+  }
+  if (/statement timeout/i.test(raw)) {
+    return `SQL took too long to execute. Try reducing the amount of seed data.`;
+  }
+  if (/exceeds maximum length/i.test(raw)) {
+    return `Generated SQL is too large to provision.`;
+  }
+  return `Provisioning failed: ${raw}`;
+}

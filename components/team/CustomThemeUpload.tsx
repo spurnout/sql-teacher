@@ -40,7 +40,12 @@ interface Props {
   readonly existingThemes: readonly CustomTheme[];
 }
 
-type InputMode = "upload" | "csv" | "manual";
+type InputMode = "upload" | "csv" | "server" | "manual";
+
+interface ServerFile {
+  readonly name: string;
+  readonly sizeMB: string;
+}
 
 const DIALECT_LABELS: Record<SqlDialect, string> = {
   postgresql: "PostgreSQL",
@@ -88,6 +93,13 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
   const [uploadProgress, setUploadProgress] = useState<string | null>(null);
   const xhrRef = useRef<XMLHttpRequest | null>(null);
 
+  // Server-side import state
+  const [serverFiles, setServerFiles] = useState<readonly ServerFile[]>([]);
+  const [selectedServerFile, setSelectedServerFile] = useState<string | null>(null);
+  const [serverDialect, setServerDialect] = useState<SqlDialect>("postgresql");
+  const [isImporting, setIsImporting] = useState(false);
+  const [importProgress, setImportProgress] = useState<string | null>(null);
+
   // CSV-specific state
   const [csvFiles, setCsvFiles] = useState<readonly CsvFile[]>([]);
   const [csvFileNames, setCsvFileNames] = useState<readonly string[]>([]);
@@ -117,6 +129,10 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
     setLargeFile(null);
     setIsUploading(false);
     setUploadProgress(null);
+    setSelectedServerFile(null);
+    setServerDialect("postgresql");
+    setIsImporting(false);
+    setImportProgress(null);
     if (xhrRef.current) {
       xhrRef.current.abort();
       xhrRef.current = null;
@@ -574,6 +590,76 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
   }, []);
 
   // -----------------------------------------------------------------------
+  // Server-side file import (reads file from mounted volume, no HTTP upload)
+  // -----------------------------------------------------------------------
+
+  const loadServerFiles = useCallback(async () => {
+    try {
+      const res = await fetch("/api/custom-themes/import");
+      if (res.ok) {
+        const data = await res.json();
+        setServerFiles(data.files ?? []);
+      }
+    } catch {
+      // Silent — server files panel just stays empty
+    }
+  }, []);
+
+  const handleServerImport = useCallback(async () => {
+    if (!selectedServerFile) return;
+    setError(null);
+    setSuccess(null);
+    setIsImporting(true);
+    setImportProgress("Server is reading and converting the file...");
+
+    try {
+      const res = await fetch("/api/custom-themes/import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fileName: selectedServerFile,
+          slug: slug.toLowerCase().replace(/\s+/g, "-"),
+          name,
+          description,
+          dialect: serverDialect,
+        }),
+      });
+
+      setImportProgress("Processing response...");
+
+      let data;
+      try {
+        data = await res.json();
+      } catch {
+        setError(`Server returned status ${res.status} with no details.`);
+        return;
+      }
+
+      if (!res.ok) {
+        setError(data.error ?? `Server error (${res.status}).`);
+        return;
+      }
+
+      setThemes((prev) => [data.theme, ...prev]);
+      const warningNote =
+        data.warnings?.length > 0
+          ? ` (${data.warnings.length} conversion warning${data.warnings.length > 1 ? "s" : ""})`
+          : "";
+      setSuccess(
+        `Theme "${name}" imported and provisioned successfully!${warningNote}`
+      );
+      setIsOpen(false);
+      resetForm();
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : "";
+      setError(`Import failed${detail ? `: ${detail}` : ""}. Check Docker logs for details.`);
+    } finally {
+      setIsImporting(false);
+      setImportProgress(null);
+    }
+  }, [selectedServerFile, slug, name, description, serverDialect, resetForm]);
+
+  // -----------------------------------------------------------------------
   // Submit (normal / small file flow)
   // -----------------------------------------------------------------------
 
@@ -725,18 +811,27 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
         >
           {/* Input mode tabs */}
           <div className="flex gap-1 p-0.5 bg-[var(--background)] rounded-md w-fit">
-            {(["upload", "csv", "manual"] as const).map((mode) => (
+            {(["upload", "csv", "server", "manual"] as const).map((mode) => (
               <button
                 key={mode}
                 type="button"
-                onClick={() => setInputMode(mode)}
+                onClick={() => {
+                  setInputMode(mode);
+                  if (mode === "server") loadServerFiles();
+                }}
                 className={`px-3 py-1 text-xs rounded transition-colors cursor-pointer ${
                   inputMode === mode
                     ? "bg-[var(--accent)] text-[var(--foreground)] font-medium"
                     : "text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
                 }`}
               >
-                {mode === "upload" ? "SQL File" : mode === "csv" ? "CSV Files" : "Manual Input"}
+                {mode === "upload"
+                  ? "SQL File"
+                  : mode === "csv"
+                    ? "CSV Files"
+                    : mode === "server"
+                      ? "Server Import"
+                      : "Manual Input"}
               </button>
             ))}
           </div>
@@ -1179,6 +1274,126 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
             </>
           )}
 
+          {/* ---- SERVER IMPORT MODE ---- */}
+          {inputMode === "server" && (
+            <>
+              <div className="p-3 bg-blue-500/10 border border-blue-500/20 rounded-md">
+                <p className="text-xs text-blue-400 font-medium mb-1">
+                  Server-Side File Import
+                </p>
+                <p className="text-[10px] text-blue-400/80">
+                  For large SQL files ({">"}50MB), place them in the <code className="font-mono bg-blue-500/20 px-1 rounded">imports/</code> folder
+                  next to docker-compose.yml. The server reads them directly from disk — no upload needed.
+                </p>
+              </div>
+
+              {/* File list */}
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className="block text-xs text-[var(--muted-foreground)]">
+                    Available Files
+                  </label>
+                  <button
+                    type="button"
+                    onClick={loadServerFiles}
+                    className="text-[10px] text-[var(--cta)] hover:underline cursor-pointer"
+                  >
+                    Refresh
+                  </button>
+                </div>
+                {serverFiles.length === 0 ? (
+                  <div className="p-4 text-center text-xs text-[var(--muted-foreground)] bg-[var(--background)] border border-[var(--border)] rounded-md">
+                    No .sql files found in imports/ directory.
+                    <br />
+                    <span className="text-[10px]">
+                      Place your SQL file there and click Refresh.
+                    </span>
+                  </div>
+                ) : (
+                  <div className="space-y-1">
+                    {serverFiles.map((f) => (
+                      <button
+                        key={f.name}
+                        type="button"
+                        onClick={() => {
+                          setSelectedServerFile(f.name);
+                          const baseName = f.name.replace(/\.(sql|csv|tsv|txt)$/i, "");
+                          setName((prev) => prev || baseName.replace(/[_-]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()));
+                          setSlug((prev) => prev || baseName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, ""));
+                        }}
+                        className={`flex items-center justify-between w-full px-3 py-2 text-xs rounded-md border transition-colors cursor-pointer ${
+                          selectedServerFile === f.name
+                            ? "border-[var(--cta)] bg-[var(--cta)]/10 text-[var(--foreground)] font-medium"
+                            : "border-[var(--border)] bg-[var(--background)] text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
+                        }`}
+                      >
+                        <span className="font-mono truncate">{f.name}</span>
+                        <span className="shrink-0 ml-2">{f.sizeMB}MB</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Dialect selector */}
+              {selectedServerFile && (
+                <div>
+                  <label className="block text-xs text-[var(--muted-foreground)] mb-1.5">
+                    SQL Dialect
+                  </label>
+                  <div className="flex gap-2">
+                    {(Object.keys(DIALECT_LABELS) as SqlDialect[]).map((d) => (
+                      <button
+                        key={d}
+                        type="button"
+                        onClick={() => setServerDialect(d)}
+                        className={`px-3 py-1.5 text-xs rounded-md border transition-colors cursor-pointer ${
+                          serverDialect === d
+                            ? "border-[var(--cta)] bg-[var(--cta)]/10 text-[var(--cta)] font-medium"
+                            : "border-[var(--border)] text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
+                        }`}
+                      >
+                        {DIALECT_LABELS[d]}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Import progress */}
+              {importProgress && (
+                <div className="p-3 bg-[var(--cta)]/5 border border-[var(--cta)]/20 rounded-md">
+                  <div className="flex items-center gap-2">
+                    <Loader2 className="w-4 h-4 animate-spin text-[var(--cta)]" />
+                    <span className="text-xs font-medium text-[var(--foreground)]">
+                      {importProgress}
+                    </span>
+                  </div>
+                  <p className="text-[10px] text-[var(--muted-foreground)] mt-1">
+                    Check Docker logs for detailed progress.
+                  </p>
+                </div>
+              )}
+
+              {/* Import button */}
+              {selectedServerFile && (
+                <button
+                  type="button"
+                  onClick={handleServerImport}
+                  disabled={isImporting || !slug.trim() || !name.trim()}
+                  className="flex items-center gap-1.5 px-4 py-2 text-xs bg-[var(--cta)] text-white rounded-md hover:opacity-90 transition-opacity disabled:opacity-50 cursor-pointer"
+                >
+                  {isImporting ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Database className="w-3.5 h-3.5" />
+                  )}
+                  {isImporting ? "Importing..." : `Import ${selectedServerFile}`}
+                </button>
+              )}
+            </>
+          )}
+
           {/* ---- MANUAL MODE ---- */}
           {inputMode === "manual" && (
             <>
@@ -1242,6 +1457,7 @@ export default function CustomThemeUpload({ existingThemes }: Props) {
               type="submit"
               disabled={
                 isSubmitting ||
+                inputMode === "server" ||
                 !schemaSql.trim() ||
                 (inputMode === "manual" && !seedSql.trim()) ||
                 !schemaRefJson.trim() ||

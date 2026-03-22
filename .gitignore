@@ -43,6 +43,10 @@ next-env.d.ts
 # docker
 postgres_data/
 
+# import files (large SQL dumps placed here for server-side import)
+/imports/*
+!/imports/.gitkeep
+
 # Claude local config
 .claude/
 
