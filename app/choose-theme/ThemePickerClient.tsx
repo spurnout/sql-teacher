@@ -38,7 +38,7 @@ export default function ThemePickerClient({ themes, currentTheme }: Props) {
       if (!res.ok) {
         setError(data.error ?? "Something went wrong.");
       } else {
-        router.push("/learn/phase-0/p0-select-star-worked");
+        router.push("/");
         router.refresh();
       }
     } catch {
