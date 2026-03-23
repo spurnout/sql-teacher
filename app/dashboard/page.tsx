@@ -1,7 +1,7 @@
 import { redirect } from "next/navigation";
 import { getCurrentUser } from "@/lib/auth/session";
 import { getAdminPool } from "@/lib/db/pool";
-import { getThemedPhases, getThemedCapstones } from "@/lib/exercises/loader";
+import { getThemedPhasesAsync, getThemedCapstones } from "@/lib/exercises/loader";
 import { getLevel, getNextLevelThreshold } from "@/lib/gamification/xp";
 import { getAllPaths, computePathProgress } from "@/lib/paths/loader";
 import DashboardClient from "./DashboardClient";
@@ -72,7 +72,7 @@ export default async function DashboardPage() {
   }));
 
   // Load themed content
-  const themedPhases = getThemedPhases(user.theme);
+  const themedPhases = await getThemedPhasesAsync(user.theme);
   const themedCapstones = getThemedCapstones(user.theme);
 
   // Build capstone progress data

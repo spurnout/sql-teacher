@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { validateQuery } from "@/lib/db/security";
-import { getThemedExercise } from "@/lib/exercises/loader";
+import { getThemedExerciseAsync } from "@/lib/exercises/loader";
 import { getCurrentUser } from "@/lib/auth/session";
 import { validateWithThemeSchema } from "@/lib/db/sandbox";
 import { getThemeDbSchema } from "@/content/themes";
@@ -48,7 +48,7 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const exercise = getThemedExercise(themeId, phase, exerciseId);
+  const exercise = await getThemedExerciseAsync(themeId, phase, exerciseId);
   if (!exercise) {
     return NextResponse.json(
       { error: "Exercise not found." },

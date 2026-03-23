@@ -276,6 +276,13 @@ export default function AdminDashboardClient({ username }: Props) {
           </span>
         </div>
         <div className="flex items-center gap-4">
+          <Link
+            href="/admin/studio"
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded border border-amber-500/30 bg-amber-500/10 text-amber-400 hover:bg-amber-500/20 transition-colors font-medium"
+          >
+            <Server className="w-3.5 h-3.5" aria-hidden="true" />
+            SQL Studio
+          </Link>
           <span className="text-sm text-[var(--muted-foreground)]">
             {username}
           </span>

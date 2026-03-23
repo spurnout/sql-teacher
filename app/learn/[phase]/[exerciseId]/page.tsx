@@ -1,8 +1,13 @@
 import { notFound, redirect } from "next/navigation";
-import { getThemedExercise, getThemedPhases } from "@/lib/exercises/loader";
+import {
+  getThemedExerciseAsync,
+  getThemedPhasesAsync,
+  getCustomThemeSchemaRef,
+} from "@/lib/exercises/loader";
 import { toClientExercise } from "@/lib/exercises/sanitize";
 import { getCurrentUser } from "@/lib/auth/session";
 import { getTheme } from "@/content/themes";
+import { isCustomThemeId } from "@/content/themes/types";
 import LearnPageClient from "./LearnPageClient";
 
 export const dynamic = "force-dynamic";
@@ -17,13 +22,14 @@ export default async function LearnPage({ params }: Props) {
   const user = await getCurrentUser();
   if (!user) redirect("/");
 
-  const exercise = getThemedExercise(user.theme, phase, exerciseId);
+  const exercise = await getThemedExerciseAsync(user.theme, phase, exerciseId);
   if (!exercise) notFound();
 
   const clientExercise = toClientExercise(exercise);
-  const themedPhases = getThemedPhases(user.theme);
-  const theme = getTheme(user.theme);
-  const schemaReference = theme?.schemaReference;
+  const themedPhases = await getThemedPhasesAsync(user.theme);
+  const schemaReference = isCustomThemeId(user.theme)
+    ? await getCustomThemeSchemaRef(user.theme)
+    : getTheme(user.theme)?.schemaReference;
 
   return (
     <LearnPageClient

@@ -1,7 +1,7 @@
 "use client";
 
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { AlertCircle, Loader2 } from "lucide-react";
+import { AlertCircle, CheckCircle2, Loader2 } from "lucide-react";
 
 interface Field {
   readonly name: string;
@@ -18,7 +18,13 @@ export type ExecutionState =
       readonly duration: number;
       readonly rowCount: number;
     }
-  | { readonly status: "error"; readonly message: string };
+  | { readonly status: "error"; readonly message: string }
+  | {
+      readonly status: "command";
+      readonly command: string;
+      readonly rowCount: number;
+      readonly duration: number;
+    };
 
 interface Props {
   readonly execution: ExecutionState;
@@ -61,6 +67,32 @@ export default function ResultsTable({ execution }: Props) {
           <pre className="text-xs text-red-400/80 whitespace-pre-wrap font-mono leading-relaxed">
             {execution.message}
           </pre>
+        </div>
+      </div>
+    );
+  }
+
+  if (execution.status === "command") {
+    const { command, rowCount: affected, duration: dur } = execution;
+    const label =
+      affected > 0
+        ? `${affected} ${affected === 1 ? "row" : "rows"} affected`
+        : "OK";
+    return (
+      <div className="flex-1 p-4">
+        <div className="bg-emerald-500/10 border border-emerald-500/25 rounded-md p-3">
+          <div className="flex items-center gap-1.5 mb-1">
+            <CheckCircle2
+              className="w-4 h-4 text-emerald-400 shrink-0"
+              aria-hidden="true"
+            />
+            <p className="text-sm font-medium text-emerald-400">
+              {command}
+            </p>
+          </div>
+          <p className="text-xs text-emerald-400/80 font-mono">
+            {label} ({dur}ms)
+          </p>
         </div>
       </div>
     );

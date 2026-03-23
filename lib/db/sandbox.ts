@@ -51,3 +51,38 @@ export async function validateWithThemeSchema(
 ): Promise<QueryResult> {
   return executeWithThemeSchema(schemaName, equivalenceQuery, { useAdmin: true });
 }
+
+/**
+ * Execute an unrestricted admin query (DML/DDL allowed) in a theme's schema.
+ * Uses the admin pool with a longer timeout. No statement validation is applied.
+ */
+export async function executeAdminQuery(
+  schemaName: string,
+  sql: string,
+  options: { timeout?: string } = {}
+): Promise<QueryResult> {
+  if (!isAllowedSchema(schemaName)) {
+    throw new Error(`Invalid schema: ${schemaName}`);
+  }
+
+  const pool = getAdminPool();
+  const client = await pool.connect();
+
+  try {
+    const escapedSchema = `"${schemaName.replace(/"/g, '""')}"`;
+    await client.query(`SET search_path = ${escapedSchema}, public`);
+    await client.query(
+      `SET statement_timeout = '${options.timeout ?? "60s"}'`
+    );
+    const result = await client.query(sql);
+    return result;
+  } finally {
+    try {
+      await client.query(`SET statement_timeout = DEFAULT`);
+      await client.query(`SET search_path = 'public'`);
+    } catch {
+      // Connection may be broken — pool will discard it
+    }
+    client.release();
+  }
+}

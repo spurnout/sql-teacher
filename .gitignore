@@ -55,4 +55,7 @@ postgres_data/
 
 # Local planning docs
 docs/plans/
+
+# Local exercise/data files (not committed — stored in DB)
+scripts/data/
 nul
