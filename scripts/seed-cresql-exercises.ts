@@ -165,7 +165,7 @@ async function main() {
           `INSERT INTO custom_theme_exercises (custom_theme_id, exercise_id, exercise_json)
            VALUES ($1, $2, $3)
            ON CONFLICT (custom_theme_id, exercise_id)
-           DO UPDATE SET exercise_json = EXCLUDED.exercise_json, updated_at = NOW()`,
+           DO UPDATE SET exercise_json = EXCLUDED.exercise_json`,
           [themeId, ex.id, JSON.stringify(ex)]
         );
         inserted++;
