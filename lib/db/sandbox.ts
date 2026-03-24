@@ -1,6 +1,6 @@
 import { getSandboxPool, getAdminPool } from "./pool";
 import { isAllowedSchema } from "@/content/themes";
-import type { QueryResult } from "pg";
+import type { QueryResult, PoolClient } from "pg";
 
 /**
  * Execute a query in a specific theme's schema.
@@ -53,6 +53,57 @@ export async function validateWithThemeSchema(
 }
 
 /**
+ * Auto-quote PascalCase identifiers (table + column names) in SQL.
+ *
+ * PostgreSQL lowercases unquoted identifiers, so `SELECT * FROM Invoice_Totals`
+ * looks for `invoice_totals` which won't match `Invoice_Totals`. This function
+ * finds unquoted identifiers that case-insensitively match names in the schema
+ * and wraps them in double quotes with the correct casing.
+ *
+ * Skips already-quoted identifiers, string literals, and comments.
+ */
+async function autoQuoteIdentifiers(
+  client: PoolClient,
+  schemaName: string,
+  sql: string
+): Promise<string> {
+  const { rows } = await client.query(
+    `SELECT DISTINCT name FROM (
+       SELECT table_name AS name FROM information_schema.tables WHERE table_schema = $1
+       UNION ALL
+       SELECT column_name AS name FROM information_schema.columns WHERE table_schema = $1
+     ) sub
+     WHERE name ~ '[A-Z]'`,
+    [schemaName]
+  );
+
+  if (rows.length === 0) return sql;
+
+  // Build lookup: lowercase → actual casing
+  const identMap = new Map<string, string>();
+  for (const row of rows) {
+    identMap.set((row.name as string).toLowerCase(), row.name as string);
+  }
+
+  // Split SQL preserving quoted strings, quoted identifiers, comments
+  const parts = sql.split(
+    /('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|--[^\n]*|\/\*[\s\S]*?\*\/)/
+  );
+
+  return parts
+    .map((part, i) => {
+      // Odd indices are captured delimiters (quoted/comment tokens) — leave as-is
+      if (i % 2 === 1) return part;
+      // Even indices are bare SQL — replace matching identifiers
+      return part.replace(/\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g, (word) => {
+        const actual = identMap.get(word.toLowerCase());
+        return actual ? `"${actual}"` : word;
+      });
+    })
+    .join("");
+}
+
+/**
  * Execute an unrestricted admin query (DML/DDL allowed) in a theme's schema.
  * Uses the admin pool with a longer timeout. No statement validation is applied.
  */
@@ -74,7 +125,9 @@ export async function executeAdminQuery(
     await client.query(
       `SET statement_timeout = '${options.timeout ?? "60s"}'`
     );
-    const result = await client.query(sql);
+    // Auto-quote PascalCase identifiers so users don't need double quotes
+    const finalSql = await autoQuoteIdentifiers(client, schemaName, sql);
+    const result = await client.query(finalSql);
     return result;
   } finally {
     try {
